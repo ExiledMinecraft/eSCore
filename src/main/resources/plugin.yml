@@ -1,0 +1,40 @@
+name: eSCore
+version: '${version}'
+main: me.clip.placeholderapi.PlaceholderAPIPlugin
+api-version: '1.20'
+load: STARTUP
+prefix: eSCore
+authors: [~VicTim~, ExiledProject Team]
+website: https://exiledproject.ru
+description: Script-driven Paper placeholder and score engine by WillowStudio.
+provides:
+  - PlaceholderAPI
+softdepend:
+  - LuckPerms
+libraries:
+  - com.google.code.gson:gson:2.11.0
+  - org.xerial:sqlite-jdbc:3.51.3.0
+  - com.mysql:mysql-connector-j:9.6.0
+  - redis.clients:jedis:6.2.0
+commands:
+  escore:
+    description: Main eSCore command.
+    aliases: [es, esc, wscore, wsc]
+    usage: /<command> <reload|check|integrations>
+  placeholderapi:
+    description: PlaceholderAPI compatibility command.
+    aliases: [papi]
+    usage: /<command> <reload|list|info|parse|parserel|ecloud>
+permissions:
+  escore.admin:
+    description: Access to eSCore administrative commands.
+    default: op
+  wscore.admin:
+    description: Legacy alias for eSCore administrative commands.
+    default: op
+  escore.bypass:
+    description: Global bypass for eSCore script watch processing.
+    default: false
+  wsc.bypass:
+    description: Legacy bypass alias for eSCore script watch processing.
+    default: false

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \":*)",
+      "Bash(gradlew.bat clean:*)",
+      "Bash(cmd /c \"gradlew.bat clean build 2>&1\")",
+      "Bash(./gradlew clean:*)"
+    ]
+  }
+}

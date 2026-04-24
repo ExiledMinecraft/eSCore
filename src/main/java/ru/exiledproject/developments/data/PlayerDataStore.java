@@ -1,0 +1,206 @@
+package ru.exiledproject.developments.data;
+
+import ru.exiledproject.developments.core.eScoreLogger;
+import ru.exiledproject.developments.eSCorePlugin;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
+
+public final class PlayerDataStore {
+    private final eSCorePlugin plugin;
+    private final eScoreLogger log;
+    private final Map<UUID, Map<String, ValueHolder>> data = new ConcurrentHashMap<>();
+    private final List<Consumer<PlayerValueChange>> listeners = new CopyOnWriteArrayList<>();
+    private final Map<String, List<Map.Entry<UUID, Double>>> topCache = new ConcurrentHashMap<>();
+
+    public PlayerDataStore(eSCorePlugin plugin, eScoreLogger log) {
+        this.plugin = plugin;
+        this.log = log;
+    }
+
+    public void addListener(Consumer<PlayerValueChange> listener) {
+        listeners.add(listener);
+    }
+
+    public void clear() {
+        data.clear();
+        topCache.clear();
+    }
+
+    public void loadSnapshot(Map<UUID, Map<String, PersistedValue>> snapshot) {
+        clear();
+        snapshot.forEach((playerId, values) -> {
+            Map<String, ValueHolder> playerValues = new ConcurrentHashMap<>();
+            values.forEach((key, persistedValue) -> playerValues.put(normalizeKey(key), new ValueHolder(normalizeValue(persistedValue.value()), persistedValue.updatedAt())));
+            if (!playerValues.isEmpty()) {
+                data.put(playerId, playerValues);
+            }
+        });
+        log.success("Loaded in-memory player state for " + data.size() + " player(s).");
+    }
+
+    public Map<UUID, Map<String, PersistedValue>> snapshot(Set<String> keys) {
+        Set<String> normalizedKeys = keys.stream().map(PlayerDataStore::normalizeKey).collect(java.util.stream.Collectors.toSet());
+        Map<UUID, Map<String, PersistedValue>> snapshot = new LinkedHashMap<>();
+        data.forEach((playerId, values) -> {
+            Map<String, PersistedValue> playerValues = new LinkedHashMap<>();
+            values.forEach((key, holder) -> {
+                if (normalizedKeys.isEmpty() || normalizedKeys.contains(key)) {
+                    playerValues.put(key, new PersistedValue(holder.value(), holder.updatedAt()));
+                }
+            });
+            if (!playerValues.isEmpty()) {
+                snapshot.put(playerId, playerValues);
+            }
+        });
+        return snapshot;
+    }
+
+    public Map<String, PersistedValue> snapshotPlayer(UUID playerId, Set<String> keys) {
+        Map<String, ValueHolder> values = data.get(playerId);
+        if (values == null) {
+            return Map.of();
+        }
+        Set<String> normalizedKeys = keys.stream().map(PlayerDataStore::normalizeKey).collect(java.util.stream.Collectors.toSet());
+        Map<String, PersistedValue> snapshot = new LinkedHashMap<>();
+        values.forEach((key, holder) -> {
+            if (normalizedKeys.isEmpty() || normalizedKeys.contains(key)) {
+                snapshot.put(key, new PersistedValue(holder.value(), holder.updatedAt()));
+            }
+        });
+        return snapshot;
+    }
+
+    public Object getValue(UUID playerId, String key, Object defaultValue) {
+        ValueHolder holder = data.getOrDefault(playerId, Collections.emptyMap()).get(normalizeKey(key));
+        return holder == null ? defaultValue : holder.value();
+    }
+
+    public PersistedValue getPersistedValue(UUID playerId, String key) {
+        ValueHolder holder = data.getOrDefault(playerId, Collections.emptyMap()).get(normalizeKey(key));
+        return holder == null ? null : new PersistedValue(holder.value(), holder.updatedAt());
+    }
+
+    public double addToPlayerNumber(UUID playerId, String key, double delta) {
+        double current = toNumber(getValue(playerId, key, 0D));
+        double updated = current + delta;
+        setValue(playerId, key, updated);
+        return updated;
+    }
+
+    public void setValue(UUID playerId, String key, Object value) {
+        setValue(playerId, key, value, ChangeOrigin.LOCAL, System.currentTimeMillis());
+    }
+
+    public void setValue(UUID playerId, String key, Object value, ChangeOrigin origin, long updatedAt) {
+        String normalizedKey = normalizeKey(key);
+        Map<String, ValueHolder> values = data.computeIfAbsent(playerId, ignored -> new ConcurrentHashMap<>());
+        ValueHolder oldHolder = values.get(normalizedKey);
+        Object oldValue = oldHolder == null ? null : oldHolder.value();
+        long previousUpdatedAt = oldHolder == null ? 0L : oldHolder.updatedAt();
+
+        if (oldHolder != null && origin != ChangeOrigin.LOCAL && updatedAt < previousUpdatedAt) {
+            return;
+        }
+
+        topCache.remove(normalizedKey);
+        Object newValue = normalizeValue(value);
+        if (newValue == null) {
+            values.remove(normalizedKey);
+            if (values.isEmpty()) {
+                data.remove(playerId);
+            }
+        } else {
+            values.put(normalizedKey, new ValueHolder(newValue, updatedAt));
+        }
+
+        if (!Objects.equals(oldValue, newValue) || previousUpdatedAt != updatedAt) {
+            PlayerValueChange change = new PlayerValueChange(playerId, normalizedKey, oldValue, newValue, origin, updatedAt);
+            listeners.forEach(listener -> listener.accept(change));
+        }
+    }
+
+    public List<Map.Entry<UUID, Double>> getTopNumbers(String key, int limit) {
+        String normalizedKey = normalizeKey(key);
+        List<Map.Entry<UUID, Double>> entries = topCache.computeIfAbsent(normalizedKey, this::computeTopNumbers);
+        if (entries.size() > limit) {
+            return new ArrayList<>(entries.subList(0, limit));
+        }
+        return new ArrayList<>(entries);
+    }
+
+    private List<Map.Entry<UUID, Double>> computeTopNumbers(String normalizedKey) {
+        List<Map.Entry<UUID, Double>> entries = new ArrayList<>();
+        data.forEach((uuid, values) -> {
+            ValueHolder holder = values.get(normalizedKey);
+            if (holder != null && holder.value() instanceof Number number) {
+                entries.add(Map.entry(uuid, number.doubleValue()));
+            }
+        });
+        entries.sort(Comparator.comparingDouble((Map.Entry<UUID, Double> entry) -> entry.getValue()).reversed());
+        return List.copyOf(entries);
+    }
+
+    private static String normalizeKey(String key) {
+        return key == null ? "" : key.trim().toLowerCase();
+    }
+
+    private static double toNumber(Object value) {
+        if (value instanceof Number number) {
+            return number.doubleValue();
+        }
+        if (value instanceof String string) {
+            try {
+                return Double.parseDouble(string);
+            } catch (NumberFormatException ignored) {
+                return 0D;
+            }
+        }
+        return 0D;
+    }
+
+    private Object normalizeValue(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Number || value instanceof Boolean || value instanceof String) {
+            return value;
+        }
+        if (value instanceof UUID uuid) {
+            return uuid.toString();
+        }
+        if (value instanceof Map<?, ?> map) {
+            Map<String, Object> normalized = new LinkedHashMap<>();
+            map.forEach((entryKey, entryValue) -> normalized.put(String.valueOf(entryKey), normalizeValue(entryValue)));
+            return normalized;
+        }
+        if (value instanceof Iterable<?> iterable) {
+            List<Object> normalized = new ArrayList<>();
+            for (Object item : iterable) {
+                normalized.add(normalizeValue(item));
+            }
+            return normalized;
+        }
+        if (value.getClass().isArray() && value instanceof Object[] array) {
+            List<Object> normalized = new ArrayList<>();
+            for (Object item : array) {
+                normalized.add(normalizeValue(item));
+            }
+            return normalized;
+        }
+        return String.valueOf(value);
+    }
+
+    private record ValueHolder(Object value, long updatedAt) {
+    }
+}

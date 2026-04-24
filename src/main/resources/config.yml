@@ -1,0 +1,100 @@
+debug: false
+server-id: auto
+
+storage:
+  backend: sqlite
+  flush-check-interval-ticks: 100
+  database-poll-interval-ticks: 40
+
+  json:
+    file: player-data.json
+
+  sqlite:
+    file: escore.db
+    table: escore_values
+
+  mysql:
+    host: 127.0.0.1
+    port: 3306
+    database: escore
+    username: root
+    password: change-me
+    table: escore_values
+    parameters: "?useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=utf8&serverTimezone=UTC"
+
+sync:
+  database-fallback: true
+  runtime-prefetch-on-join: true
+
+  redis:
+    enabled: false
+    host: 127.0.0.1
+    port: 6379
+    password: ""
+    database: 0
+    channel: escore:sync
+    key-prefix: escore
+    runtime-ttl-millis: 300000
+    connection-timeout-millis: 2000
+
+scripts:
+  directory: scripts
+  stop-on-first-error: false
+  cache:
+    default-placeholder-ttl-millis: 250
+    default-source-refresh-ttl-millis: 250
+  profile:
+    enabled: true
+    slow-call-threshold-millis: 15
+
+integrations:
+  luckperms: true
+
+placeholderapi:
+  parser:
+    keep-unresolved-placeholders: true
+    max-passes: 2
+
+  expansions:
+    class-scan-timeout-millis: 5000
+    slow-load-warning-millis: 1000
+
+  ecloud:
+    enabled: true
+    preload-on-startup: true
+    cache-ttl-millis: 1800000
+    startup-timeout-millis: 15000
+    command-timeout-millis: 15000
+    connect-timeout-millis: 5000
+    read-timeout-millis: 15000
+    user-agent: eSCore/1.0
+    mirrors:
+      - https://api.extendedclip.com/expansions/all/
+      - https://ecloud.placeholderapi.com/expansions/all/
+
+luckperms:
+  # Legacy single-rule format. Kept for backward compatibility.
+  context-storage-keys:
+    - dragon_kills
+  exact-context-key: escore:dragon-kills
+  bucket-context-key: escore:dragon-kills-bucket
+  flag-context-key: escore:has-dragon-kill
+  buckets:
+    none: 0
+    slayer: 1
+    hunter: 5
+    legend: 25
+
+  # Preferred format for release use. Define one or more context rules.
+  contexts: []
+  # Example:
+  # contexts:
+  #   - storage-key: dragon_kills
+  #     exact-key: escore:dragon-kills
+  #     bucket-key: escore:dragon-kills-bucket
+  #     flag-key: escore:has-dragon-kill
+  #     buckets:
+  #       none: 0
+  #       slayer: 1
+  #       hunter: 5
+  #       legend: 25

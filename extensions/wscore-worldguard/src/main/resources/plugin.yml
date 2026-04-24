@@ -1,0 +1,11 @@
+name: WScoreWorldGuard
+version: '${version}'
+main: ru.willowstudio.wscore.worldguard.WScoreWorldGuardPlugin
+api-version: '1.20'
+authors: [WillowStudio]
+website: https://willowstudio.ru
+description: WorldGuard integration bridge for WScore.
+depend:
+  - WScore
+  - WorldGuard
+

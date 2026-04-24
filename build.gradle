@@ -1,0 +1,95 @@
+plugins {
+    id 'java'
+    id('xyz.jpenilla.run-paper') version '2.3.1'
+    id('com.gradleup.shadow') version '8.3.6'
+}
+
+group = 'ru.exiledproject.developments'
+version = '1.9.5'
+
+base {
+    archivesName = 'eSCore'
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'papermc-repo'
+        url = 'https://repo.papermc.io/repository/maven-public/'
+    }
+    maven {
+        name = 'placeholderapi'
+        url = 'https://repo.helpch.at/releases'
+    }
+}
+
+dependencies {
+    compileOnly('io.papermc.paper:paper-api:1.20.1-R0.1-SNAPSHOT')
+    compileOnly('net.luckperms:api:5.4')
+
+    // Bundled into the fat jar because Paper cannot resolve the js-community POM directly.
+    implementation('org.graalvm.polyglot:polyglot:24.1.0')
+    implementation('org.graalvm.polyglot:js-community:24.1.0')
+
+    // Runtime libraries loaded by Paper from plugin.yml.
+    implementation('com.google.code.gson:gson:2.11.0')
+    implementation('org.xerial:sqlite-jdbc:3.51.3.0')
+    implementation('com.mysql:mysql-connector-j:9.6.0')
+    implementation('redis.clients:jedis:6.2.0')
+}
+
+jar {
+    enabled = false
+}
+
+shadowJar {
+    archiveClassifier.set('')
+    mergeServiceFiles()
+
+    dependencies {
+        include(dependency('org.graalvm.polyglot:.*'))
+        include(dependency('org.graalvm.js:.*'))
+        include(dependency('org.graalvm.truffle:.*'))
+        include(dependency('org.graalvm.sdk:.*'))
+        include(dependency('org.graalvm.regex:.*'))
+        include(dependency('org.graalvm.shadowed:.*'))
+    }
+}
+
+assemble {
+    dependsOn shadowJar
+}
+
+tasks {
+    runServer {
+        minecraftVersion('1.21.8')
+    }
+}
+
+def targetJavaVersion = 17
+java {
+    def javaVersion = JavaVersion.toVersion(targetJavaVersion)
+    sourceCompatibility = javaVersion
+    targetCompatibility = javaVersion
+    if (JavaVersion.current() < javaVersion) {
+        toolchain.languageVersion = JavaLanguageVersion.of(targetJavaVersion)
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs += ['-Xlint:deprecation']
+
+    if (targetJavaVersion >= 10 || JavaVersion.current().isJava10Compatible()) {
+        options.release.set(targetJavaVersion)
+    }
+}
+
+processResources {
+    def props = [version: version]
+    inputs.properties props
+    filteringCharset 'UTF-8'
+    filesMatching('plugin.yml') {
+        expand props
+    }
+}
