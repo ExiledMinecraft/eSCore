@@ -1,6 +1,8 @@
 package ru.exiledproject.developments.script;
 
-public record ScriptValueSource(Type type, String key, Object value) {
+import ru.exiledproject.developments.api.eScoreScope;
+
+public record ScriptValueSource(Type type, String key, Object value, eScoreScope scope) {
     public enum Type {
         PLAYER_DATA,
         PLACEHOLDER_API,

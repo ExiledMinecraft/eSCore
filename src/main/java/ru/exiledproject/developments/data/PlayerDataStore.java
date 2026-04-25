@@ -1,7 +1,9 @@
 package ru.exiledproject.developments.data;
 
+import ru.exiledproject.developments.api.eScoreScope;
 import ru.exiledproject.developments.core.eScoreLogger;
 import ru.exiledproject.developments.eSCorePlugin;
+import ru.exiledproject.developments.storage.StorageScopeKeys;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -82,8 +84,34 @@ public final class PlayerDataStore {
     }
 
     public Object getValue(UUID playerId, String key, Object defaultValue) {
-        ValueHolder holder = data.getOrDefault(playerId, Collections.emptyMap()).get(normalizeKey(key));
-        return holder == null ? defaultValue : holder.value();
+        String normalizedKey = normalizeKey(key);
+        Map<String, ValueHolder> values = data.getOrDefault(playerId, Collections.emptyMap());
+        if (StorageScopeKeys.isServerScopedKey(normalizedKey)) {
+            ValueHolder holder = values.get(normalizedKey);
+            if (holder != null) {
+                return holder.value();
+            }
+            String logicalKey = StorageScopeKeys.logicalKey(normalizedKey);
+            boolean hasScopedValues = values.keySet().stream()
+                    .anyMatch(candidateKey -> StorageScopeKeys.isServerScopedKey(candidateKey) && StorageScopeKeys.matchesLogicalKey(candidateKey, logicalKey));
+            if (!hasScopedValues) {
+                ValueHolder exact = values.get(logicalKey);
+                return exact == null ? defaultValue : exact.value();
+            }
+            return defaultValue;
+        }
+        return getValue(playerId, normalizedKey, defaultValue, eScoreScope.ALL_SERVERS, plugin.getServerId());
+    }
+
+    public Object getValue(UUID playerId, String key, Object defaultValue, eScoreScope scope, String serverId) {
+        String normalizedKey = normalizeKey(key);
+        Map<String, ValueHolder> values = data.getOrDefault(playerId, Collections.emptyMap());
+        ValueHolder direct = values.get(normalizedKey);
+        if (scope == eScoreScope.CURRENT_SERVER && StorageScopeKeys.isServerScopedKey(normalizedKey)) {
+            return direct == null ? defaultValue : direct.value();
+        }
+        AggregatedValue aggregatedValue = aggregateValue(values, normalizedKey, scope, serverId);
+        return aggregatedValue == null ? defaultValue : aggregatedValue.value();
     }
 
     public PersistedValue getPersistedValue(UUID playerId, String key) {
@@ -113,7 +141,7 @@ public final class PlayerDataStore {
             return;
         }
 
-        topCache.remove(normalizedKey);
+        topCache.clear();
         Object newValue = normalizeValue(value);
         if (newValue == null) {
             values.remove(normalizedKey);
@@ -131,24 +159,73 @@ public final class PlayerDataStore {
     }
 
     public List<Map.Entry<UUID, Double>> getTopNumbers(String key, int limit) {
+        return getTopNumbers(key, limit, eScoreScope.ALL_SERVERS, plugin.getServerId());
+    }
+
+    public List<Map.Entry<UUID, Double>> getTopNumbers(String key, int limit, eScoreScope scope, String serverId) {
         String normalizedKey = normalizeKey(key);
-        List<Map.Entry<UUID, Double>> entries = topCache.computeIfAbsent(normalizedKey, this::computeTopNumbers);
+        String cacheKey = topCacheKey(normalizedKey, scope, serverId);
+        List<Map.Entry<UUID, Double>> entries = topCache.computeIfAbsent(cacheKey, ignored -> computeTopNumbers(normalizedKey, scope, serverId));
         if (entries.size() > limit) {
             return new ArrayList<>(entries.subList(0, limit));
         }
         return new ArrayList<>(entries);
     }
 
-    private List<Map.Entry<UUID, Double>> computeTopNumbers(String normalizedKey) {
+    private List<Map.Entry<UUID, Double>> computeTopNumbers(String normalizedKey, eScoreScope scope, String serverId) {
         List<Map.Entry<UUID, Double>> entries = new ArrayList<>();
         data.forEach((uuid, values) -> {
-            ValueHolder holder = values.get(normalizedKey);
-            if (holder != null && holder.value() instanceof Number number) {
-                entries.add(Map.entry(uuid, number.doubleValue()));
+            AggregatedValue value = aggregateValue(values, normalizedKey, scope, serverId);
+            if (value != null && isNumeric(value.value())) {
+                entries.add(Map.entry(uuid, toNumber(value.value())));
             }
         });
         entries.sort(Comparator.comparingDouble((Map.Entry<UUID, Double> entry) -> entry.getValue()).reversed());
         return List.copyOf(entries);
+    }
+
+    private AggregatedValue aggregateValue(Map<String, ValueHolder> values, String logicalOrRawKey, eScoreScope scope, String serverId) {
+        String logicalKey = StorageScopeKeys.logicalKey(logicalOrRawKey);
+        ValueHolder exact = values.get(logicalKey);
+        List<ValueHolder> scopedValues = new ArrayList<>();
+        String currentServerKey = StorageScopeKeys.serverKey(logicalKey, serverId);
+
+        values.forEach((candidateKey, holder) -> {
+            if (StorageScopeKeys.isServerScopedKey(candidateKey) && StorageScopeKeys.matchesLogicalKey(candidateKey, logicalKey)) {
+                scopedValues.add(holder);
+            }
+        });
+
+        if (scope == eScoreScope.CURRENT_SERVER) {
+            ValueHolder currentServerValue = values.get(currentServerKey);
+            if (currentServerValue != null) {
+                return new AggregatedValue(currentServerValue.value(), currentServerValue.updatedAt());
+            }
+            if (!scopedValues.isEmpty()) {
+                return null;
+            }
+            return exact == null ? null : new AggregatedValue(exact.value(), exact.updatedAt());
+        }
+
+        if (scopedValues.isEmpty()) {
+            return exact == null ? null : new AggregatedValue(exact.value(), exact.updatedAt());
+        }
+
+        boolean numeric = scopedValues.stream().allMatch(holder -> isNumeric(holder.value()));
+        if (numeric) {
+            double total = 0D;
+            long updatedAt = 0L;
+            for (ValueHolder holder : scopedValues) {
+                total += toNumber(holder.value());
+                updatedAt = Math.max(updatedAt, holder.updatedAt());
+            }
+            return new AggregatedValue(total, updatedAt);
+        }
+
+        ValueHolder latest = scopedValues.stream()
+                .max(Comparator.comparingLong(ValueHolder::updatedAt))
+                .orElse(null);
+        return latest == null ? null : new AggregatedValue(latest.value(), latest.updatedAt());
     }
 
     private static String normalizeKey(String key) {
@@ -167,6 +244,25 @@ public final class PlayerDataStore {
             }
         }
         return 0D;
+    }
+
+    private static boolean isNumeric(Object value) {
+        if (value instanceof Number) {
+            return true;
+        }
+        if (value instanceof String string) {
+            try {
+                Double.parseDouble(string);
+                return true;
+            } catch (NumberFormatException ignored) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private static String topCacheKey(String key, eScoreScope scope, String serverId) {
+        return scope.name() + "::" + (serverId == null ? "" : serverId.toLowerCase()) + "::" + StorageScopeKeys.logicalKey(key);
     }
 
     private Object normalizeValue(Object value) {
@@ -202,5 +298,8 @@ public final class PlayerDataStore {
     }
 
     private record ValueHolder(Object value, long updatedAt) {
+    }
+
+    private record AggregatedValue(Object value, long updatedAt) {
     }
 }

@@ -1,31 +1,33 @@
-# Хуки и Java API WScore
+# Хуки и Java API eSCore
 
 ## Получение API
 
 ### Через `ServicesManager`
 
 ```java
-RegisteredServiceProvider<WScoreApi> provider =
-        Bukkit.getServicesManager().getRegistration(WScoreApi.class);
+RegisteredServiceProvider<eScoreApi> provider =
+        Bukkit.getServicesManager().getRegistration(eScoreApi.class);
 
 if (provider != null) {
-    WScoreApi api = provider.getProvider();
+    eScoreApi api = provider.getProvider();
 }
 ```
 
 ### Через статический провайдер
 
 ```java
-WScoreApi api = WScoreProvider.get();
+eScoreApi api = eScoreProvider.get();
 ```
 
 ## Что умеет API
 
-Через `WScoreApi` можно:
+Через `eScoreApi` можно:
+
 - читать значения игрока;
+- читать значения игрока с учётом области `все серверы / текущий сервер`;
 - записывать значения игрока;
 - увеличивать числовые значения;
-- резолвить placeholder WScore;
+- резолвить placeholder `eSCore`;
 - читать контекст, который экспортирует JS-скрипт;
 - регистрировать value provider'ы для `hook:`-источников;
 - регистрировать свои placeholder-hook'и;
@@ -38,35 +40,61 @@ WScoreApi api = WScoreProvider.get();
 ```java
 Optional<Object> getPlayerValue(UUID playerId, String key);
 Object getPlayerValue(UUID playerId, String key, Object defaultValue);
+Object getPlayerValue(UUID playerId, String key, Object defaultValue, eScoreScope scope);
 void setPlayerValue(UUID playerId, String key, Object value);
 double addToPlayerNumber(UUID playerId, String key, double delta);
 Optional<String> resolvePlaceholder(OfflinePlayer player, String placeholderId);
+Optional<String> resolvePlaceholder(OfflinePlayer player, String placeholderId, eScoreScope scope);
 Optional<Object> resolveValueHook(OfflinePlayer player, String providerId, String key);
 Optional<Object> getScriptContext(OfflinePlayer player, String placeholderId);
 Map<String, String> getIntegrationStates();
-WScoreRegistration registerPlaceholderHook(WScorePlaceholderHook hook);
-WScoreRegistration registerValueProvider(WScoreValueProvider provider);
-WScoreRegistration registerEventBridge(WScoreEventBridge<?> bridge);
+eScoreRegistration registerPlaceholderHook(eScorePlaceholderHook hook);
+eScoreRegistration registerValueProvider(eScoreValueProvider provider);
+eScoreRegistration registerEventBridge(eScoreEventBridge<?> bridge);
 void fireChannelEvent(String channel, UUID playerId, Map<String, Object> payload);
 ```
+
+## Области значений
+
+Для чтения значений и placeholder'ов используется enum `eScoreScope`:
+
+- `eScoreScope.ALL_SERVERS`
+- `eScoreScope.CURRENT_SERVER`
+
+Это нужно для multi-server сценария, когда один и тот же placeholder должен уметь отдавать:
+
+- суммарное значение по всем серверам;
+- только локальное значение текущего сервера.
+
+Пример:
+
+```java
+Object totalPlaytime = api.getPlayerValue(playerId, "playtime", 0D, eScoreScope.ALL_SERVERS);
+Object localPlaytime = api.getPlayerValue(playerId, "playtime", 0D, eScoreScope.CURRENT_SERVER);
+
+String total = api.resolvePlaceholder(player, "playtime").orElse("0");
+String local = api.resolvePlaceholder(player, "playtime__server").orElse("0");
+```
+
+По умолчанию `eSCore` читает значение со всех серверов. Режим `CURRENT_SERVER` особенно полезен для скриптов с `serverScoped: true`.
 
 ## Регистрация собственного placeholder-hook'а
 
 ```java
-api.registerPlaceholderHook(new WScorePlaceholderHook() {
+api.registerPlaceholderHook(new eScorePlaceholderHook() {
     @Override
     public String getId() {
         return "example_current_mode";
     }
 
     @Override
-    public String onRequest(OfflinePlayer player) {
+    public String resolve(OfflinePlayer player, eScoreApi api) {
         return "lobby";
     }
 });
 ```
 
-После этого placeholder будет доступен через WScore.
+После этого placeholder будет доступен через `eSCore`.
 
 ## Ручная отправка события в канал
 
@@ -83,7 +111,7 @@ JS-скрипт может слушать этот канал так:
 ```js
 watch: [{
   channel: "example:coins_reward",
-  update: function (event, current, ctx) {
+  update(event, current, ctx) {
     return ctx.number(current, 0) + ctx.number(event.payload().amount, 0);
   }
 }]
@@ -91,27 +119,27 @@ watch: [{
 
 ## Auto event bridge
 
-Если нужно быстро связать Bukkit/Paper-событие с каналом WScore, используйте `registerEventBridge(...)`.
+Если нужно быстро связать Bukkit/Paper-событие с каналом `eSCore`, используйте `registerEventBridge(...)`.
 
 ```java
-api.registerEventBridge(new WScoreEventBridge<PlayerJoinEvent>() {
+api.registerEventBridge(new eScoreEventBridge<PlayerJoinEvent>() {
     @Override
-    public String channel() {
+    public String getChannel() {
         return "example:player_join";
     }
 
     @Override
-    public Class<PlayerJoinEvent> eventType() {
+    public Class<PlayerJoinEvent> getEventClass() {
         return PlayerJoinEvent.class;
     }
 
     @Override
-    public UUID extractPlayerId(PlayerJoinEvent event, WScoreApi api) {
+    public UUID extractPlayerId(PlayerJoinEvent event, eScoreApi api) {
         return event.getPlayer().getUniqueId();
     }
 
     @Override
-    public Map<String, Object> payload(PlayerJoinEvent event, WScoreApi api) {
+    public Map<String, Object> payload(PlayerJoinEvent event, eScoreApi api) {
         return Map.of("name", event.getPlayer().getName());
     }
 });
@@ -119,17 +147,17 @@ api.registerEventBridge(new WScoreEventBridge<PlayerJoinEvent>() {
 
 ## Value provider для `hook:`-источников
 
-Если плагин умеет отдавать собственное значение напрямую, его лучше регистрировать как `WScoreValueProvider`.
+Если плагин умеет отдавать собственное значение напрямую, его лучше регистрировать как `eScoreValueProvider`.
 
 ```java
-api.registerValueProvider(new WScoreValueProvider() {
+api.registerValueProvider(new eScoreValueProvider() {
     @Override
     public String getId() {
         return "worldguard";
     }
 
     @Override
-    public Object getValue(OfflinePlayer player, String key) {
+    public Object resolve(OfflinePlayer player, String key, eScoreApi api) {
         if ("current_region".equalsIgnoreCase(key)) {
             return "spawn";
         }
@@ -162,18 +190,25 @@ api.getScriptContext(player, "dragon_kills").ifPresent(context -> {
 
 ## Событие изменения значения
 
-WScore вызывает Bukkit event при изменении значения игрока.
+`eSCore` вызывает Bukkit event при изменении значения игрока.
 
 ```java
 @EventHandler
-public void onValueChange(WScoreValueChangeEvent event) {
+public void onValueChange(eScoreValueChangeEvent event) {
     if (event.getKey().equals("dragon_kills")) {
         System.out.println(event.getNewValue());
     }
 }
 ```
 
+Импорт:
+
+```java
+import ru.exiledproject.developments.api.event.eScoreValueChangeEvent;
+```
+
 Это удобно для:
+
 - реакции на изменение счётчиков;
 - отладки;
 - синхронизации с другим плагином;
@@ -202,9 +237,10 @@ public void onValueChange(WScoreValueChangeEvent event) {
 Отдельный Java-хук для этого не нужен.
 
 Если встроенная интеграция LuckPerms включена, скрипт может напрямую:
+
 - читать группу, префикс и суффикс;
 - проверять группы и права;
 - задавать runtime-контексты через `ctx.setLuckPermsContext(...)`;
 - читать их через `ctx.luckPermsContext(...)`.
 
-Это часть встроенной интеграции WScore, а не внешний bridge.
+Это часть встроенной интеграции `eSCore`, а не внешний bridge.

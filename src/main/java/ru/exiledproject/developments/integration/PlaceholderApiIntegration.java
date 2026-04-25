@@ -73,6 +73,7 @@ public final class PlaceholderApiIntegration implements IntegrationAdapter {
         lines.add(status.message());
         if (status.active()) {
             lines.add("Identifiers: %escore_<placeholder>%, legacy %wscore_<placeholder>%");
+            lines.add("Scope suffixes: __server for current server, __all for all servers (default).");
             lines.add("Loaded expansions: " + plugin.getPlaceholderCompatManager().getLocalExpansionManager().getExpansions().size());
         }
         return lines;

@@ -20,11 +20,13 @@ import org.graalvm.polyglot.HostAccess;
 import org.graalvm.polyglot.Source;
 import org.graalvm.polyglot.Value;
 import ru.exiledproject.developments.api.eScoreApi;
+import ru.exiledproject.developments.api.eScoreScope;
 import ru.exiledproject.developments.core.eScoreLogger;
 import ru.exiledproject.developments.data.ChangeOrigin;
 import ru.exiledproject.developments.data.PlayerDataStore;
 import ru.exiledproject.developments.data.PlayerValueChange;
 import ru.exiledproject.developments.eSCorePlugin;
+import ru.exiledproject.developments.storage.StorageScopeKeys;
 
 import java.io.IOException;
 import java.text.DecimalFormat;
@@ -170,7 +172,7 @@ public final class ScriptManager {
     }
 
     public eScoreScript getPrimaryScriptByStorageKey(String storageKey) {
-        String normalizedStorageKey = normalize(storageKey);
+        String normalizedStorageKey = StorageScopeKeys.logicalKey(normalize(storageKey));
         Set<String> owners = storageKeyOwners.getOrDefault(normalizedStorageKey, Set.of());
         if (owners.isEmpty()) {
             for (eScoreScript script : scripts.values()) {
@@ -197,7 +199,7 @@ public final class ScriptManager {
             return Optional.empty();
         }
 
-        Object sourceValue = resolveBaseValue(script, player);
+        Object sourceValue = resolveBaseValue(script, player, eScoreScope.ALL_SERVERS);
         ScriptInvocationContext context = new ScriptInvocationContext(script, player, sourceValue);
         try {
             synchronized (script.runtime()) {
@@ -224,6 +226,21 @@ public final class ScriptManager {
             }
         }
         return keys;
+    }
+
+    public boolean isTrackedStorageKey(String storageKey) {
+        return getPrimaryScriptByStorageKey(storageKey) != null;
+    }
+
+    public String resolveStorageWriteKey(String storageKey) {
+        String normalizedKey = normalize(storageKey);
+        if (normalizedKey.isBlank() || StorageScopeKeys.isServerScopedKey(normalizedKey)) {
+            return normalizedKey;
+        }
+        eScoreScript script = getPrimaryScriptByStorageKey(normalizedKey);
+        return script != null && script.serverScoped()
+                ? currentServerStorageKey(normalizedKey)
+                : normalizedKey;
     }
 
     public List<String> getProfileLines() {
@@ -275,7 +292,7 @@ public final class ScriptManager {
             return;
         }
 
-        String normalizedKey = normalize(change.key());
+        String normalizedKey = StorageScopeKeys.logicalKey(normalize(change.key()));
         if (!normalizedKey.equals(script.storageKey())) {
             return;
         }
@@ -585,6 +602,7 @@ public final class ScriptManager {
         long flushIntervalMillis = readLong(persistenceValue, "flushIntervalMillis", readLong(definition, "flushIntervalMillis", 1000L));
         Value syncValue = definition.getMember("sync");
         SyncMode syncMode = parseSyncMode(syncValue, persistenceMode);
+        boolean serverScoped = readBooleanAny(definition, "serverScoped", "server_scoped", "perServer", "per_server");
         long remoteTtlMillis = readLong(syncValue, "remoteTtlMillis", plugin.getConfig().getLong("sync.redis.runtime-ttl-millis", 300000L));
         Set<String> dependencies = readStringArray(definition.getMember("dependsOn"));
         if (source.type() == ScriptValueSource.Type.WSCORE && source.key() != null) {
@@ -634,6 +652,7 @@ public final class ScriptManager {
                 remoteTtlMillis,
                 persistenceMode,
                 syncMode,
+                serverScoped,
                 dependencies,
                 source,
                 transform,
@@ -694,58 +713,99 @@ public final class ScriptManager {
 
     private ScriptValueSource parseSource(Value sourceValue, String storageKey, Object defaultValue) {
         if (sourceValue == null || sourceValue.isNull()) {
-            return new ScriptValueSource(ScriptValueSource.Type.PLAYER_DATA, storageKey, defaultValue);
+            return new ScriptValueSource(ScriptValueSource.Type.PLAYER_DATA, storageKey, defaultValue, null);
         }
 
         if (sourceValue.isString()) {
             String source = sourceValue.asString();
             if (source.startsWith("%") && source.endsWith("%")) {
-                return new ScriptValueSource(ScriptValueSource.Type.PLACEHOLDER_API, source, defaultValue);
+                return new ScriptValueSource(ScriptValueSource.Type.PLACEHOLDER_API, source, defaultValue, null);
+            }
+            if (source.startsWith("escore-server:") || source.startsWith("wscore-server:")) {
+                String prefix = source.startsWith("escore-server:") ? "escore-server:" : "wscore-server:";
+                return new ScriptValueSource(
+                        ScriptValueSource.Type.WSCORE,
+                        normalize(source.substring(prefix.length())),
+                        defaultValue,
+                        eScoreScope.CURRENT_SERVER
+                );
+            }
+            if (source.startsWith("escore-all:") || source.startsWith("wscore-all:")) {
+                String prefix = source.startsWith("escore-all:") ? "escore-all:" : "wscore-all:";
+                return new ScriptValueSource(
+                        ScriptValueSource.Type.WSCORE,
+                        normalize(source.substring(prefix.length())),
+                        defaultValue,
+                        eScoreScope.ALL_SERVERS
+                );
+            }
+            if (source.startsWith("data-server:")) {
+                return new ScriptValueSource(
+                        ScriptValueSource.Type.PLAYER_DATA,
+                        normalize(source.substring("data-server:".length())),
+                        defaultValue,
+                        eScoreScope.CURRENT_SERVER
+                );
+            }
+            if (source.startsWith("data-all:")) {
+                return new ScriptValueSource(
+                        ScriptValueSource.Type.PLAYER_DATA,
+                        normalize(source.substring("data-all:".length())),
+                        defaultValue,
+                        eScoreScope.ALL_SERVERS
+                );
             }
             if (source.startsWith("escore:") || source.startsWith("wscore:")) {
                 String prefix = source.startsWith("escore:") ? "escore:" : "wscore:";
                 return new ScriptValueSource(
                         ScriptValueSource.Type.WSCORE,
                         normalize(source.substring(prefix.length())),
-                        defaultValue
+                        defaultValue,
+                        null
                 );
             }
             if (source.startsWith("data:")) {
                 return new ScriptValueSource(
                         ScriptValueSource.Type.PLAYER_DATA,
                         normalize(source.substring("data:".length())),
-                        defaultValue
+                        defaultValue,
+                        null
                 );
             }
             if (source.startsWith("hook:")) {
                 return new ScriptValueSource(
                         ScriptValueSource.Type.HOOK,
                         normalizeHookReference(source.substring("hook:".length())),
-                        defaultValue
+                        defaultValue,
+                        null
                 );
             }
-            return new ScriptValueSource(ScriptValueSource.Type.CONSTANT, null, source);
+            return new ScriptValueSource(ScriptValueSource.Type.CONSTANT, null, source, null);
         }
 
         String type = Optional.ofNullable(readString(sourceValue, "type"))
                 .orElse("player-data")
                 .toLowerCase(Locale.ROOT);
+        eScoreScope scope = parseScopeValue(readStringAny(sourceValue, "scope", "storageScope", "storage_scope"));
 
         return switch (type) {
             case "player-data", "data" -> new ScriptValueSource(
                     ScriptValueSource.Type.PLAYER_DATA,
                     Optional.ofNullable(readString(sourceValue, "key")).map(this::normalize).orElse(storageKey),
-                    defaultValue
+                    defaultValue,
+                    scope
             );
             case "placeholderapi", "papi" -> new ScriptValueSource(
                     ScriptValueSource.Type.PLACEHOLDER_API,
                     readString(sourceValue, "value"),
-                    defaultValue
+                    defaultValue,
+                    scope
             );
             case "escore", "wscore", "internal" -> new ScriptValueSource(
                     ScriptValueSource.Type.WSCORE,
                     Optional.ofNullable(readString(sourceValue, "placeholder")).map(this::normalize).orElse(storageKey),
-                    defaultValue
+                    defaultValue,
+                    scope
             );
             case "hook", "provider", "integration-hook" -> new ScriptValueSource(
                     ScriptValueSource.Type.HOOK,
@@ -753,14 +813,27 @@ public final class ScriptManager {
                             Optional.ofNullable(readString(sourceValue, "provider")).orElse(readString(sourceValue, "id")),
                             Optional.ofNullable(readString(sourceValue, "key")).orElse(readString(sourceValue, "value"))
                     ),
-                    defaultValue
+                    defaultValue,
+                    scope
             );
             case "constant" -> new ScriptValueSource(
                     ScriptValueSource.Type.CONSTANT,
                     null,
-                    convertValue(sourceValue.getMember("value"))
+                    convertValue(sourceValue.getMember("value")),
+                    scope
             );
             default -> throw new IllegalArgumentException("Unknown source type: " + type);
+        };
+    }
+
+    private eScoreScope parseScopeValue(String rawScope) {
+        if (rawScope == null || rawScope.isBlank()) {
+            return null;
+        }
+        return switch (normalize(rawScope)) {
+            case "all", "global", "all_servers", "allservers", "shared" -> eScoreScope.ALL_SERVERS;
+            case "server", "current", "current_server", "currentserver", "local" -> eScoreScope.CURRENT_SERVER;
+            default -> throw new IllegalArgumentException("Unknown source scope: " + rawScope);
         };
     }
 
@@ -920,7 +993,13 @@ public final class ScriptManager {
     }
 
     public Optional<String> resolvePlaceholder(OfflinePlayer player, String id) {
-        String normalized = normalize(id);
+        return resolvePlaceholder(player, id, eScoreScope.ALL_SERVERS);
+    }
+
+    public Optional<String> resolvePlaceholder(OfflinePlayer player, String id, eScoreScope defaultScope) {
+        ScopedPlaceholderRequest scopedRequest = parseScopedPlaceholderRequest(id, defaultScope);
+        String normalized = scopedRequest.placeholderId();
+        eScoreScope scope = scopedRequest.scope();
         String resolvedId = aliases.getOrDefault(normalized, normalized);
         eScoreScript script = scripts.get(resolvedId);
         ScriptLeaderboardRequest leaderboardRequest = null;
@@ -944,12 +1023,12 @@ public final class ScriptManager {
         stack.push(script.id());
         try {
             if (leaderboardRequest != null) {
-                return Optional.of(resolveLeaderboardPlaceholder(script, leaderboardRequest, player));
+                return Optional.of(resolveLeaderboardPlaceholder(script, leaderboardRequest, player, scope));
             }
             if (player != null && script.cacheTtlMillis() > 0L) {
-                return Optional.ofNullable(resolveCachedPlaceholder(script, player));
+                return Optional.ofNullable(resolveCachedPlaceholder(script, player, scope));
             }
-            return Optional.ofNullable(renderPlaceholder(script, player));
+            return Optional.ofNullable(renderPlaceholder(script, player, scope));
         } catch (Exception exception) {
             log.warn("Failed to resolve script placeholder " + script.id() + ": " + exception.getMessage());
             return Optional.empty();
@@ -959,6 +1038,23 @@ public final class ScriptManager {
                 placeholderStack.remove();
             }
         }
+    }
+
+    private ScopedPlaceholderRequest parseScopedPlaceholderRequest(String placeholderId, eScoreScope defaultScope) {
+        String normalized = normalize(placeholderId);
+        String[] currentServerSuffixes = {"__current_server", "__server", "__current", "__local"};
+        for (String suffix : currentServerSuffixes) {
+            if (normalized.endsWith(suffix) && normalized.length() > suffix.length()) {
+                return new ScopedPlaceholderRequest(normalized.substring(0, normalized.length() - suffix.length()), eScoreScope.CURRENT_SERVER);
+            }
+        }
+        String[] allServerSuffixes = {"__all_servers", "__all", "__global"};
+        for (String suffix : allServerSuffixes) {
+            if (normalized.endsWith(suffix) && normalized.length() > suffix.length()) {
+                return new ScopedPlaceholderRequest(normalized.substring(0, normalized.length() - suffix.length()), eScoreScope.ALL_SERVERS);
+            }
+        }
+        return new ScopedPlaceholderRequest(normalized, defaultScope == null ? eScoreScope.ALL_SERVERS : defaultScope);
     }
 
     private ScriptLeaderboardRequest parseLeaderboardRequest(String normalizedId) {
@@ -1002,8 +1098,8 @@ public final class ScriptManager {
         return new ScriptLeaderboardRequest(baseId, position, periodId, field);
     }
 
-    private String resolveLeaderboardPlaceholder(eScoreScript script, ScriptLeaderboardRequest request, OfflinePlayer player) {
-        ScriptLeaderboardEntry entry = resolveLeaderboardEntry(script, request.position(), request.periodId());
+    private String resolveLeaderboardPlaceholder(eScoreScript script, ScriptLeaderboardRequest request, OfflinePlayer player, eScoreScope scope) {
+        ScriptLeaderboardEntry entry = resolveLeaderboardEntry(script, request.position(), request.periodId(), scope);
         ScriptNoDataPolicy noDataPolicy = script.leaderboardDefinition().noDataPolicy();
         ScriptInvocationContext context = new ScriptInvocationContext(script, player, entry);
 
@@ -1021,7 +1117,7 @@ public final class ScriptManager {
         };
     }
 
-    private ScriptLeaderboardEntry resolveLeaderboardEntry(eScoreScript script, int position, String periodId) {
+    private ScriptLeaderboardEntry resolveLeaderboardEntry(eScoreScript script, int position, String periodId, eScoreScope scope) {
         ScriptLeaderboardDefinition leaderboardDefinition = script.leaderboardDefinition();
         ScriptLeaderboardDefinition.PeriodDefinition periodDefinition = leaderboardDefinition.periods().get(normalize(periodId));
         if (periodDefinition == null) {
@@ -1029,7 +1125,7 @@ public final class ScriptManager {
         }
 
         String storageKey = leaderboardStorageKey(script, periodDefinition, System.currentTimeMillis());
-        List<Map.Entry<UUID, Double>> entries = dataStore.getTopNumbers(storageKey, position);
+        List<Map.Entry<UUID, Double>> entries = dataStore.getTopNumbers(storageKey, position, scope, plugin.getServerId());
         if (entries.size() < position) {
             return ScriptLeaderboardEntry.missing(script, periodId, position);
         }
@@ -1086,7 +1182,7 @@ public final class ScriptManager {
     }
 
     public void invalidateStorageKey(UUID playerId, String storageKey) {
-        String normalizedKey = normalize(storageKey);
+        String normalizedKey = StorageScopeKeys.logicalKey(normalize(storageKey));
         Set<String> affected = new LinkedHashSet<>();
         affected.addAll(storageKeyOwners.getOrDefault(normalizedKey, Set.of()));
         affected.addAll(dataKeyDependents.getOrDefault(normalizedKey, Set.of()));
@@ -1094,9 +1190,11 @@ public final class ScriptManager {
         ArrayDeque<String> queue = new ArrayDeque<>(affected);
         while (!queue.isEmpty()) {
             String placeholderId = queue.removeFirst();
-            PlaceholderCacheKey cacheKey = new PlaceholderCacheKey(playerId, placeholderId);
-            placeholderCache.remove(cacheKey);
-            sourceCache.remove(cacheKey);
+            for (eScoreScope scope : eScoreScope.values()) {
+                PlaceholderCacheKey cacheKey = new PlaceholderCacheKey(playerId, placeholderId, scope);
+                placeholderCache.remove(cacheKey);
+                sourceCache.remove(cacheKey);
+            }
             for (String dependent : dependentPlaceholders.getOrDefault(placeholderId, Set.of())) {
                 if (affected.add(dependent)) {
                     queue.addLast(dependent);
@@ -1105,23 +1203,23 @@ public final class ScriptManager {
         }
     }
 
-    private String resolveCachedPlaceholder(eScoreScript script, OfflinePlayer player) {
-        PlaceholderCacheKey cacheKey = new PlaceholderCacheKey(player.getUniqueId(), script.id());
+    private String resolveCachedPlaceholder(eScoreScript script, OfflinePlayer player, eScoreScope scope) {
+        PlaceholderCacheKey cacheKey = new PlaceholderCacheKey(player.getUniqueId(), script.id(), scope);
         CacheEntry cached = placeholderCache.get(cacheKey);
         long now = System.currentTimeMillis();
         if (cached != null && cached.expiresAt() >= now) {
             return cached.value() == null ? "" : String.valueOf(cached.value());
         }
 
-        String rendered = renderPlaceholder(script, player);
+        String rendered = renderPlaceholder(script, player, scope);
         placeholderCache.put(cacheKey, new CacheEntry(rendered, now + script.cacheTtlMillis()));
         return rendered;
     }
 
-    private String renderPlaceholder(eScoreScript script, OfflinePlayer player) {
+    private String renderPlaceholder(eScoreScript script, OfflinePlayer player, eScoreScope scope) {
         long startedAt = System.nanoTime();
         try {
-            Object value = resolveBaseValue(script, player);
+            Object value = resolveBaseValue(script, player, scope);
             ScriptInvocationContext context = new ScriptInvocationContext(script, player, value);
 
             synchronized (script.runtime()) {
@@ -1154,9 +1252,10 @@ public final class ScriptManager {
         }
 
         for (String storageKey : activeLeaderboardStorageKeys(script, timestamp)) {
-            double bucketCurrent = toNumber(dataStore.getValue(playerId, storageKey, 0D));
+            String runtimeStorageKey = runtimeStorageKey(storageKey, script.serverScoped());
+            double bucketCurrent = toNumber(dataStore.getValue(playerId, runtimeStorageKey, 0D));
             double bucketUpdated = bucketCurrent + delta;
-            dataStore.setValue(playerId, storageKey, bucketUpdated, origin, timestamp);
+            dataStore.setValue(playerId, runtimeStorageKey, bucketUpdated, origin, timestamp);
         }
     }
 
@@ -1229,35 +1328,36 @@ public final class ScriptManager {
         return 0D;
     }
 
-    private Object resolveBaseValue(eScoreScript script, OfflinePlayer player) {
+    private Object resolveBaseValue(eScoreScript script, OfflinePlayer player, eScoreScope scope) {
         ScriptValueSource source = script.source();
         if (player != null && script.sourceRefreshTtlMillis() > 0L && (source.type() == ScriptValueSource.Type.PLACEHOLDER_API
                 || source.type() == ScriptValueSource.Type.WSCORE
                 || source.type() == ScriptValueSource.Type.HOOK)) {
-            PlaceholderCacheKey cacheKey = new PlaceholderCacheKey(player.getUniqueId(), script.id());
+            PlaceholderCacheKey cacheKey = new PlaceholderCacheKey(player.getUniqueId(), script.id(), scope);
             CacheEntry cached = sourceCache.get(cacheKey);
             long now = System.currentTimeMillis();
             if (cached != null && cached.expiresAt() >= now) {
                 return cached.value();
             }
-            Object resolved = resolveSourceValue(script, player, source);
+            Object resolved = resolveSourceValue(script, player, source, scope);
             sourceCache.put(cacheKey, new CacheEntry(resolved, now + script.sourceRefreshTtlMillis()));
             return resolved;
         }
-        return resolveSourceValue(script, player, source);
+        return resolveSourceValue(script, player, source, scope);
     }
 
-    private Object resolveSourceValue(eScoreScript script, OfflinePlayer player, ScriptValueSource source) {
+    private Object resolveSourceValue(eScoreScript script, OfflinePlayer player, ScriptValueSource source, eScoreScope requestedScope) {
+        eScoreScope effectiveScope = source.scope() == null ? requestedScope : source.scope();
         return switch (source.type()) {
             case PLAYER_DATA -> player == null
                     ? script.defaultValue()
-                    : dataStore.getValue(player.getUniqueId(), source.key(), script.defaultValue());
+                    : dataStore.getValue(player.getUniqueId(), source.key(), script.defaultValue(), effectiveScope, plugin.getServerId());
             case PLACEHOLDER_API -> player == null
                     ? script.defaultValue()
                     : plugin.getIntegrationManager().formatWithPlaceholderApi(player, String.valueOf(source.key()), script.defaultValue());
             case WSCORE -> player == null
                     ? script.defaultValue()
-                    : resolvePlaceholder(player, source.key()).orElse(script.defaultValue() == null ? null : String.valueOf(script.defaultValue()));
+                    : resolvePlaceholder(player, source.key(), effectiveScope).orElse(script.defaultValue() == null ? null : String.valueOf(script.defaultValue()));
             case HOOK -> player == null
                     ? script.defaultValue()
                     : resolveHookValue(player, source.key(), script.defaultValue());
@@ -1274,6 +1374,15 @@ public final class ScriptManager {
             return fallback;
         }
         return api.resolveValueHook(player, reference.substring(0, separator), reference.substring(separator + 1)).orElse(fallback);
+    }
+
+    private String runtimeStorageKey(String storageKey, boolean serverScoped) {
+        String logicalKey = StorageScopeKeys.logicalKey(storageKey);
+        return serverScoped ? currentServerStorageKey(logicalKey) : logicalKey;
+    }
+
+    private String currentServerStorageKey(String logicalKey) {
+        return StorageScopeKeys.serverKey(logicalKey, plugin.getServerId());
     }
 
     private void registerEventWatcher(WatcherBinding binding) {
@@ -1312,7 +1421,8 @@ public final class ScriptManager {
             }
         }
 
-        Object current = dataStore.getValue(player.getUniqueId(), binding.script().storageKey(), binding.script().defaultValue());
+        String runtimeStorageKey = runtimeStorageKey(binding.script().storageKey(), binding.script().serverScoped());
+        Object current = dataStore.getValue(player.getUniqueId(), runtimeStorageKey, binding.script().defaultValue());
         ScriptInvocationContext context = new ScriptInvocationContext(binding.script(), player, current);
         long startedAt = System.nanoTime();
         try {
@@ -1325,7 +1435,7 @@ public final class ScriptManager {
                 }
 
                 Object updated = convertValue(binding.watch().updateFunction().execute(event, current, context));
-                dataStore.setValue(player.getUniqueId(), binding.script().storageKey(), updated);
+                dataStore.setValue(player.getUniqueId(), runtimeStorageKey, updated);
             }
         } finally {
             recordProfile(binding.script().id(), System.nanoTime() - startedAt);
@@ -1640,17 +1750,25 @@ public final class ScriptManager {
         }
 
         public Object data(String key, Object fallback) {
-            return player == null ? fallback : dataStore.getValue(player.getUniqueId(), key, fallback);
+            return player == null ? fallback : dataStore.getValue(player.getUniqueId(), key, fallback, eScoreScope.ALL_SERVERS, plugin.getServerId());
+        }
+
+        public Object dataServer(String key, Object fallback) {
+            return player == null ? fallback : dataStore.getValue(player.getUniqueId(), key, fallback, eScoreScope.CURRENT_SERVER, plugin.getServerId());
+        }
+
+        public Object dataAll(String key, Object fallback) {
+            return data(key, fallback);
         }
 
         public void setData(String key, Object value) {
             if (player != null) {
-                dataStore.setValue(player.getUniqueId(), key, value);
+                dataStore.setValue(player.getUniqueId(), resolveStorageWriteKey(key), value);
             }
         }
 
         public double add(String key, double delta) {
-            return player == null ? 0D : dataStore.addToPlayerNumber(player.getUniqueId(), key, delta);
+            return player == null ? 0D : dataStore.addToPlayerNumber(player.getUniqueId(), resolveStorageWriteKey(key), delta);
         }
 
         public String placeholder(String placeholder) {
@@ -1661,11 +1779,27 @@ public final class ScriptManager {
         }
 
         public String wscore(String placeholderId) {
-            return player == null ? "" : api.resolvePlaceholder(player, placeholderId).orElse("");
+            return player == null ? "" : api.resolvePlaceholder(player, placeholderId, eScoreScope.ALL_SERVERS).orElse("");
         }
 
         public String escore(String placeholderId) {
             return wscore(placeholderId);
+        }
+
+        public String wscoreServer(String placeholderId) {
+            return player == null ? "" : api.resolvePlaceholder(player, placeholderId, eScoreScope.CURRENT_SERVER).orElse("");
+        }
+
+        public String escoreServer(String placeholderId) {
+            return wscoreServer(placeholderId);
+        }
+
+        public String wscoreAll(String placeholderId) {
+            return wscore(placeholderId);
+        }
+
+        public String escoreAll(String placeholderId) {
+            return escore(placeholderId);
         }
 
         public String integration(String id) {
@@ -1732,10 +1866,22 @@ public final class ScriptManager {
         }
 
         public Object top(String key, int position, String type) {
+            return topAll(key, position, type);
+        }
+
+        public Object topServer(String key, int position, String type) {
+            return topScoped(key, position, type, eScoreScope.CURRENT_SERVER);
+        }
+
+        public Object topAll(String key, int position, String type) {
+            return topScoped(key, position, type, eScoreScope.ALL_SERVERS);
+        }
+
+        private Object topScoped(String key, int position, String type, eScoreScope scope) {
             if (position < 1) {
                 return "";
             }
-            List<Map.Entry<UUID, Double>> entries = dataStore.getTopNumbers(key, position);
+            List<Map.Entry<UUID, Double>> entries = dataStore.getTopNumbers(key, position, scope, plugin.getServerId());
             if (entries.size() < position) {
                 return "";
             }
@@ -1751,6 +1897,18 @@ public final class ScriptManager {
         }
 
         public Object leaderboard(String placeholderId, int position, String periodId, String field) {
+            return leaderboardAll(placeholderId, position, periodId, field);
+        }
+
+        public Object leaderboardServer(String placeholderId, int position, String periodId, String field) {
+            return leaderboardScoped(placeholderId, position, periodId, field, eScoreScope.CURRENT_SERVER);
+        }
+
+        public Object leaderboardAll(String placeholderId, int position, String periodId, String field) {
+            return leaderboardScoped(placeholderId, position, periodId, field, eScoreScope.ALL_SERVERS);
+        }
+
+        private Object leaderboardScoped(String placeholderId, int position, String periodId, String field, eScoreScope scope) {
             eScoreScript targetScript = getScriptByPlaceholder(placeholderId);
             if (targetScript == null || !targetScript.leaderboardDefinition().enabled()) {
                 return "";
@@ -1761,7 +1919,7 @@ public final class ScriptManager {
                     normalize(periodId),
                     normalize(field)
             );
-            return resolveLeaderboardPlaceholder(targetScript, request, player);
+            return resolveLeaderboardPlaceholder(targetScript, request, player, scope);
         }
 
         /**
@@ -2023,10 +2181,13 @@ public final class ScriptManager {
     private record CompiledScriptFile(ScriptRuntime runtime, List<eScoreScript> scripts, int watcherCount) {
     }
 
-    private record PlaceholderCacheKey(UUID playerId, String placeholderId) {
+    private record PlaceholderCacheKey(UUID playerId, String placeholderId, eScoreScope scope) {
     }
 
     private record CacheEntry(Object value, long expiresAt) {
+    }
+
+    private record ScopedPlaceholderRequest(String placeholderId, eScoreScope scope) {
     }
 
     private record ScriptProfile(AtomicLong calls, AtomicLong totalNanos, AtomicLong maxNanos) {

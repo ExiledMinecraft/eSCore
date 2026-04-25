@@ -520,7 +520,10 @@ public final class ScriptToolkit {
             Matcher matcher = TIME_SEGMENT.matcher(text);
             long total = 0L;
             while (matcher.find()) {
-                long amount = Long.parseLong(matcher.group(1));
+                long amount = parseTimeAmount(matcher.group(1));
+                if (amount <= 0L) {
+                    continue;
+                }
                 String unit = matcher.group(2).toLowerCase(Locale.ROOT);
                 total += switch (unit) {
                     case "d", "д" -> amount * 86400L;
@@ -546,11 +549,29 @@ public final class ScriptToolkit {
             long m = (totalSeconds % 3600L) / 60L;
             long s = totalSeconds % 60L;
             StringBuilder sb = new StringBuilder();
-            if (d > 0) sb.append(d).append('d');
-            if (h > 0) { if (!sb.isEmpty()) sb.append(' '); sb.append(h).append('h'); }
-            if (m > 0) { if (!sb.isEmpty()) sb.append(' '); sb.append(m).append('m'); }
-            if (s > 0 || sb.isEmpty()) { if (!sb.isEmpty()) sb.append(' '); sb.append(s).append('s'); }
+            appendTimeSegment(sb, d, 'd', false);
+            appendTimeSegment(sb, h, 'h', false);
+            appendTimeSegment(sb, m, 'm', false);
+            appendTimeSegment(sb, s, 's', true);
             return sb.toString();
+        }
+
+        private long parseTimeAmount(String input) {
+            try {
+                return Long.parseLong(input);
+            } catch (NumberFormatException ignored) {
+                return 0L;
+            }
+        }
+
+        private void appendTimeSegment(StringBuilder builder, long value, char unit, boolean includeWhenEmpty) {
+            if (value <= 0L && !includeWhenEmpty) {
+                return;
+            }
+            if (!builder.isEmpty()) {
+                builder.append(' ');
+            }
+            builder.append(value).append(unit);
         }
     }
 

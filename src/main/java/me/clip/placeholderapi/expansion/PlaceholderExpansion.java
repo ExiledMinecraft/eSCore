@@ -8,6 +8,7 @@ import org.bukkit.configuration.ConfigurationSection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.logging.Level;
 
 public abstract class PlaceholderExpansion extends PlaceholderHook {
@@ -172,6 +173,11 @@ public abstract class PlaceholderExpansion extends PlaceholderHook {
         return getIdentifier().equals(expansion.getIdentifier())
                 && getAuthor().equals(expansion.getAuthor())
                 && getVersion().equals(expansion.getVersion());
+    }
+
+    @Override
+    public final int hashCode() {
+        return Objects.hash(getIdentifier(), getAuthor(), getVersion());
     }
 
     @Override

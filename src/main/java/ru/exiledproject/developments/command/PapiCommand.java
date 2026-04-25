@@ -925,7 +925,7 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
 
         String mode = args[2].toLowerCase(Locale.ROOT);
         if ("all".equals(mode) || "installed".equals(mode)) {
-            int page = args.length >= 4 && isInteger(args[3]) ? Integer.parseInt(args[3]) : 1;
+            int page = args.length >= 4 ? parseIntegerOrDefault(args[3], 1) : 1;
             return new EcloudListRequest(mode, "", page);
         }
         if ("search".equals(mode)) {
@@ -933,7 +933,7 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
             String query = "";
             if (args.length >= 4) {
                 if (isInteger(args[args.length - 1])) {
-                    page = Integer.parseInt(args[args.length - 1]);
+                    page = parseIntegerOrDefault(args[args.length - 1], 1);
                     query = join(args, 3, args.length - 1);
                 } else {
                     query = join(args, 3);
@@ -945,7 +945,7 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
         int page = 1;
         String query;
         if (isInteger(args[args.length - 1])) {
-            page = Integer.parseInt(args[args.length - 1]);
+            page = parseIntegerOrDefault(args[args.length - 1], 1);
             query = join(args, 2, args.length - 1);
         } else {
             query = join(args, 2);
@@ -963,6 +963,17 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
             }
         }
         return true;
+    }
+
+    private int parseIntegerOrDefault(String input, int fallback) {
+        if (!isInteger(input)) {
+            return fallback;
+        }
+        try {
+            return Integer.parseInt(input);
+        } catch (NumberFormatException ignored) {
+            return fallback;
+        }
     }
 
     private String blank(String value) {

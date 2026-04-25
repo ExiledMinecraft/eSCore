@@ -46,7 +46,10 @@ public final class StorageManager {
             backend = createBackend();
             backend.initialize();
             Set<String> persistentKeys = scriptManager.getPersistentKeys();
-            dataStore.loadSnapshot(persistentKeys.isEmpty() ? Map.of() : backend.loadAll(persistentKeys));
+            Map<UUID, Map<String, PersistedValue>> snapshot = persistentKeys.isEmpty()
+                    ? Map.of()
+                    : filterSnapshot(backend.loadAll(Set.of()));
+            dataStore.loadSnapshot(snapshot);
             pendingWrites.clear();
             lastPollTimestamp = System.currentTimeMillis();
             log.success("Storage backend initialized: " + backend.getId());
@@ -124,7 +127,10 @@ public final class StorageManager {
         try {
             long previousPoll = lastPollTimestamp;
             lastPollTimestamp = System.currentTimeMillis();
-            for (StorageWrite update : backend.pollUpdates(previousPoll, scriptManager.getPersistentKeys())) {
+            for (StorageWrite update : backend.pollUpdates(previousPoll, Set.of())) {
+                if (!scriptManager.isTrackedStorageKey(update.key())) {
+                    continue;
+                }
                 dataStore.setValue(update.playerId(), update.key(), update.value(), ChangeOrigin.REMOTE_DATABASE, update.updatedAt());
             }
         } catch (Exception exception) {
@@ -139,7 +145,7 @@ public final class StorageManager {
         }
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
             try {
-                Map<String, PersistedValue> values = backend.loadPlayer(playerId, persistentKeys);
+                Map<String, PersistedValue> values = filterPlayerValues(backend.loadPlayer(playerId, Set.of()));
                 values.forEach((key, value) -> dataStore.setValue(playerId, key, value.value(), ChangeOrigin.REMOTE_DATABASE, value.updatedAt()));
             } catch (Exception exception) {
                 log.debug("Prefetch failed for " + playerId + ": " + exception.getMessage());
@@ -182,6 +188,27 @@ public final class StorageManager {
             );
             default -> throw new IllegalArgumentException("Unknown storage backend: " + backendId);
         };
+    }
+
+    private Map<UUID, Map<String, PersistedValue>> filterSnapshot(Map<UUID, Map<String, PersistedValue>> snapshot) {
+        Map<UUID, Map<String, PersistedValue>> filtered = new ConcurrentHashMap<>();
+        snapshot.forEach((playerId, values) -> {
+            Map<String, PersistedValue> filteredValues = filterPlayerValues(values);
+            if (!filteredValues.isEmpty()) {
+                filtered.put(playerId, filteredValues);
+            }
+        });
+        return filtered;
+    }
+
+    private Map<String, PersistedValue> filterPlayerValues(Map<String, PersistedValue> values) {
+        Map<String, PersistedValue> filtered = new ConcurrentHashMap<>();
+        values.forEach((key, value) -> {
+            if (scriptManager.isTrackedStorageKey(key)) {
+                filtered.put(key, value);
+            }
+        });
+        return filtered;
     }
 
     private record ValueKey(UUID playerId, String key) {

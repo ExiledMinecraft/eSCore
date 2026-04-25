@@ -8,6 +8,7 @@ import ru.exiledproject.developments.api.eScoreApi;
 import ru.exiledproject.developments.api.eScoreEventBridge;
 import ru.exiledproject.developments.api.eScorePlaceholderHook;
 import ru.exiledproject.developments.api.eScoreRegistration;
+import ru.exiledproject.developments.api.eScoreScope;
 import ru.exiledproject.developments.api.eScoreValueProvider;
 import ru.exiledproject.developments.data.PlayerDataStore;
 import ru.exiledproject.developments.eSCorePlugin;
@@ -50,26 +51,36 @@ public final class eScoreApiImpl implements eScoreApi {
 
     @Override
     public Optional<Object> getPlayerValue(UUID playerId, String key) {
-        return Optional.ofNullable(dataStore.getValue(playerId, key, null));
+        return Optional.ofNullable(getPlayerValue(playerId, key, null, eScoreScope.ALL_SERVERS));
     }
 
     @Override
     public Object getPlayerValue(UUID playerId, String key, Object defaultValue) {
-        return dataStore.getValue(playerId, key, defaultValue);
+        return getPlayerValue(playerId, key, defaultValue, eScoreScope.ALL_SERVERS);
+    }
+
+    @Override
+    public Object getPlayerValue(UUID playerId, String key, Object defaultValue, eScoreScope scope) {
+        return dataStore.getValue(playerId, key, defaultValue, scope, plugin.getServerId());
     }
 
     @Override
     public void setPlayerValue(UUID playerId, String key, Object value) {
-        dataStore.setValue(playerId, key, value);
+        dataStore.setValue(playerId, resolveWriteKey(key), value);
     }
 
     @Override
     public double addToPlayerNumber(UUID playerId, String key, double delta) {
-        return dataStore.addToPlayerNumber(playerId, key, delta);
+        return dataStore.addToPlayerNumber(playerId, resolveWriteKey(key), delta);
     }
 
     @Override
     public Optional<String> resolvePlaceholder(OfflinePlayer player, String placeholderId) {
+        return resolvePlaceholder(player, placeholderId, eScoreScope.ALL_SERVERS);
+    }
+
+    @Override
+    public Optional<String> resolvePlaceholder(OfflinePlayer player, String placeholderId, eScoreScope scope) {
         String normalized = normalize(placeholderId);
         if (normalized.isEmpty()) {
             return Optional.empty();
@@ -84,11 +95,14 @@ public final class eScoreApiImpl implements eScoreApi {
         stack.push(normalized);
         try {
             eScorePlaceholderHook externalHook = externalHooks.get(normalized);
+            if (externalHook == null) {
+                externalHook = externalHooks.get(stripScopeSuffix(normalized));
+            }
             if (externalHook != null) {
                 return Optional.ofNullable(externalHook.resolve(player, this));
             }
             ScriptManager manager = scriptManager;
-            return manager == null ? Optional.empty() : manager.resolvePlaceholder(player, normalized);
+            return manager == null ? Optional.empty() : manager.resolvePlaceholder(player, normalized, scope);
         } finally {
             stack.pop();
             if (stack.isEmpty()) {
@@ -203,5 +217,21 @@ public final class eScoreApiImpl implements eScoreApi {
 
     private String normalize(String value) {
         return value == null ? "" : value.trim().toLowerCase();
+    }
+
+    private String resolveWriteKey(String key) {
+        ScriptManager manager = scriptManager;
+        return manager == null ? normalize(key) : manager.resolveStorageWriteKey(key);
+    }
+
+    private String stripScopeSuffix(String placeholderId) {
+        String normalized = normalize(placeholderId);
+        String[] suffixes = {"__current_server", "__all_servers", "__server", "__current", "__local", "__all", "__global"};
+        for (String suffix : suffixes) {
+            if (normalized.endsWith(suffix) && normalized.length() > suffix.length()) {
+                return normalized.substring(0, normalized.length() - suffix.length());
+            }
+        }
+        return normalized;
     }
 }

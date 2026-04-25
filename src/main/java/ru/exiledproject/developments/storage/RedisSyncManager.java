@@ -108,7 +108,9 @@ public final class RedisSyncManager {
             Set<String> keys = new LinkedHashSet<>();
             for (eScoreScript script : scriptManager.getScripts()) {
                 if (storageManager.resolveSyncMode(script) == SyncMode.REDIS) {
-                    keys.add(script.storageKey());
+                    keys.add(script.serverScoped()
+                            ? scriptManager.resolveStorageWriteKey(script.storageKey())
+                            : script.storageKey());
                 }
             }
             withJedis(jedis -> {
@@ -118,7 +120,7 @@ public final class RedisSyncManager {
                         continue;
                     }
                     RedisMessage message = gson.fromJson(raw, RedisMessage.class);
-                    dataStore.setValue(playerId, key, message.value(), ChangeOrigin.REMOTE_REDIS, message.updatedAt());
+                    dataStore.setValue(playerId, message.key(), message.value(), ChangeOrigin.REMOTE_REDIS, message.updatedAt());
                 }
             });
         });

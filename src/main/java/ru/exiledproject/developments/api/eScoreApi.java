@@ -8,15 +8,29 @@ import java.util.Optional;
 import java.util.UUID;
 
 public interface eScoreApi {
-    Optional<Object> getPlayerValue(UUID playerId, String key);
+    default Optional<Object> getPlayerValue(UUID playerId, String key) {
+        return Optional.ofNullable(getPlayerValue(playerId, key, null, eScoreScope.ALL_SERVERS));
+    }
 
-    Object getPlayerValue(UUID playerId, String key, Object defaultValue);
+    default Object getPlayerValue(UUID playerId, String key, Object defaultValue) {
+        return getPlayerValue(playerId, key, defaultValue, eScoreScope.ALL_SERVERS);
+    }
+
+    default Optional<Object> getPlayerValue(UUID playerId, String key, eScoreScope scope) {
+        return Optional.ofNullable(getPlayerValue(playerId, key, null, scope));
+    }
+
+    Object getPlayerValue(UUID playerId, String key, Object defaultValue, eScoreScope scope);
 
     void setPlayerValue(UUID playerId, String key, Object value);
 
     double addToPlayerNumber(UUID playerId, String key, double delta);
 
-    Optional<String> resolvePlaceholder(OfflinePlayer player, String placeholderId);
+    default Optional<String> resolvePlaceholder(OfflinePlayer player, String placeholderId) {
+        return resolvePlaceholder(player, placeholderId, eScoreScope.ALL_SERVERS);
+    }
+
+    Optional<String> resolvePlaceholder(OfflinePlayer player, String placeholderId, eScoreScope scope);
 
     Optional<Object> resolveValueHook(OfflinePlayer player, String providerId, String key);
 

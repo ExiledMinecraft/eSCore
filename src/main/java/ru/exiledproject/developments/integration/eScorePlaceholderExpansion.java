@@ -5,6 +5,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.OfflinePlayer;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import ru.exiledproject.developments.api.eScoreScope;
 import ru.exiledproject.developments.core.eScoreApiImpl;
 import ru.exiledproject.developments.eSCorePlugin;
 
@@ -51,21 +52,22 @@ public final class eScorePlaceholderExpansion extends PlaceholderExpansion {
 
     @Override
     public @Nullable String onRequest(OfflinePlayer player, @NotNull String params) {
-        String normalized = params.toLowerCase(Locale.ROOT);
+        ScopedPlaceholderRequest scopedRequest = parseScopedRequest(params);
+        String normalized = scopedRequest.placeholderId();
         if (normalized.startsWith("data_")) {
             if (player == null) {
                 return "";
             }
-            Object value = api.getPlayerValue(player.getUniqueId(), normalized.substring("data_".length()), "");
+            Object value = api.getPlayerValue(player.getUniqueId(), normalized.substring("data_".length()), "", scopedRequest.scope());
             return String.valueOf(value);
         }
         if (normalized.startsWith("top_")) {
-            return topValue(normalized);
+            return topValue(normalized, scopedRequest.scope());
         }
-        return api.resolvePlaceholder(player, normalized).orElse("");
+        return api.resolvePlaceholder(player, normalized, scopedRequest.scope()).orElse("");
     }
 
-    private String topValue(String input) {
+    private String topValue(String input, eScoreScope scope) {
         String[] parts = input.split("_");
         if (parts.length < 4) {
             return "";
@@ -81,7 +83,7 @@ public final class eScorePlaceholderExpansion extends PlaceholderExpansion {
         }
 
         String key = String.join("_", List.of(parts).subList(1, parts.length - 2));
-        List<Map.Entry<UUID, Double>> topEntries = plugin.getDataStore().getTopNumbers(key, position);
+        List<Map.Entry<UUID, Double>> topEntries = plugin.getDataStore().getTopNumbers(key, position, scope, plugin.getServerId());
         if (topEntries.size() < position || position < 1) {
             return "";
         }
@@ -96,5 +98,25 @@ public final class eScorePlaceholderExpansion extends PlaceholderExpansion {
             return value % 1D == 0D ? Long.toString((long) value) : Double.toString(value);
         }
         return "";
+    }
+
+    private ScopedPlaceholderRequest parseScopedRequest(String input) {
+        String normalized = input == null ? "" : input.trim().toLowerCase(Locale.ROOT);
+        String[] currentServerSuffixes = {"__current_server", "__server", "__current", "__local"};
+        for (String suffix : currentServerSuffixes) {
+            if (normalized.endsWith(suffix) && normalized.length() > suffix.length()) {
+                return new ScopedPlaceholderRequest(normalized.substring(0, normalized.length() - suffix.length()), eScoreScope.CURRENT_SERVER);
+            }
+        }
+        String[] allServerSuffixes = {"__all_servers", "__all", "__global"};
+        for (String suffix : allServerSuffixes) {
+            if (normalized.endsWith(suffix) && normalized.length() > suffix.length()) {
+                return new ScopedPlaceholderRequest(normalized.substring(0, normalized.length() - suffix.length()), eScoreScope.ALL_SERVERS);
+            }
+        }
+        return new ScopedPlaceholderRequest(normalized, eScoreScope.ALL_SERVERS);
+    }
+
+    private record ScopedPlaceholderRequest(String placeholderId, eScoreScope scope) {
     }
 }

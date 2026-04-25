@@ -26,6 +26,7 @@ public final class eScoreScript {
     private final long remoteTtlMillis;
     private final PersistenceMode persistenceMode;
     private final SyncMode syncMode;
+    private final boolean serverScoped;
     private final Set<String> dependencies;
     private final ScriptValueSource source;
     private final Value transformFunction;
@@ -61,6 +62,7 @@ public final class eScoreScript {
             long remoteTtlMillis,
             PersistenceMode persistenceMode,
             SyncMode syncMode,
+            boolean serverScoped,
             Set<String> dependencies,
             ScriptValueSource source,
             Value transformFunction,
@@ -89,6 +91,7 @@ public final class eScoreScript {
         this.remoteTtlMillis = remoteTtlMillis;
         this.persistenceMode = persistenceMode;
         this.syncMode = syncMode;
+        this.serverScoped = serverScoped;
         this.dependencies = dependencies;
         this.source = source;
         this.transformFunction = transformFunction;
@@ -167,6 +170,10 @@ public final class eScoreScript {
 
     public SyncMode syncMode() {
         return syncMode;
+    }
+
+    public boolean serverScoped() {
+        return serverScoped;
     }
 
     public Set<String> dependencies() {

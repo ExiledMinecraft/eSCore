@@ -246,6 +246,22 @@ aliases: ["dk", "dragonkill_count"]
 storageKey: "dragon_kills"
 ```
 
+## `serverScoped`
+
+Флаг для multi-server сценария, в котором одно и то же значение должно храниться отдельно по каждому серверу, но по умолчанию читаться как сумма со всех серверов.
+
+```js
+serverScoped: true
+```
+
+Когда `serverScoped: true`:
+
+- запись идёт в локальный ключ текущего `server-id`;
+- обычный placeholder читает сумму со всех серверов;
+- placeholder с суффиксом `__server` читает только локальное значение текущего сервера.
+
+Это особенно полезно для счётчиков вроде времени в игре, убийств, добытых ресурсов и другой статистики, которая накапливается на нескольких серверах в общей MySQL-базе.
+
 ## `numeric`
 
 Флаг, что placeholder логически является числовым.
@@ -303,6 +319,38 @@ source: "wscore:dragon_kills"
 source: "data:dragon_kills"
 ```
 
+### `escore-server:<id>` и `wscore-server:<id>`
+
+Чтение placeholder'а только для текущего сервера.
+
+```js
+source: "escore-server:playtime"
+```
+
+### `escore-all:<id>` и `wscore-all:<id>`
+
+Явное чтение placeholder'а в режиме "все серверы".
+
+```js
+source: "escore-all:playtime"
+```
+
+### `data-server:<key>`
+
+Чтение raw value только для текущего сервера.
+
+```js
+source: "data-server:playtime"
+```
+
+### `data-all:<key>`
+
+Явное чтение raw value со всех серверов.
+
+```js
+source: "data-all:playtime"
+```
+
 ### `%placeholder%`
 
 Чтение из внешнего PlaceholderAPI expansion'а.
@@ -331,6 +379,16 @@ source: {
 }
 ```
 
+Для object-формы `source` можно дополнительно указать `scope`:
+
+```js
+source: {
+  type: "data",
+  key: "playtime",
+  scope: "server"
+}
+```
+
 Поддерживаются типы:
 
 - `player-data`
@@ -344,6 +402,45 @@ source: {
 - `provider`
 - `integration-hook`
 - `constant`
+
+Поддерживаются scope-значения:
+
+- `all`
+- `all_servers`
+- `global`
+- `server`
+- `current_server`
+- `local`
+
+## Суффиксы placeholder'ов по серверу
+
+У любого placeholder'а `eSCore` можно указать область чтения прямо в id.
+
+По умолчанию используется режим "все серверы":
+
+```text
+%escore_playtime%
+```
+
+Для текущего сервера:
+
+```text
+%escore_playtime__server%
+```
+
+Явный режим "все серверы":
+
+```text
+%escore_playtime__all%
+```
+
+Также поддерживаются расширенные суффиксы:
+
+- `__current_server`
+- `__current`
+- `__local`
+- `__all_servers`
+- `__global`
 
 ## `transform(value, ctx)`
 
@@ -639,17 +736,32 @@ bypassPermission: "myplugin.bypass.dragon_kills"
 - `ctx.bool(value, fallback)`
 - `ctx.player()`
 - `ctx.playerId()`
+- `ctx.data(key, fallback)`
+- `ctx.dataServer(key, fallback)`
+- `ctx.dataAll(key, fallback)`
 - `ctx.placeholder("%player_name%")`
 - `ctx.escore("dragon_kills")`
+- `ctx.escoreServer("dragon_kills")`
+- `ctx.escoreAll("dragon_kills")`
 - `ctx.wscore("dragon_kills")`
+- `ctx.wscoreServer("dragon_kills")`
+- `ctx.wscoreAll("dragon_kills")`
 - `ctx.integration("luckperms")`
 - `ctx.hook("luckperms", "prefix", "")`
 - `ctx.scriptContext("dragon_kills")`
-- `ctx.set(key, value)`
+- `ctx.setData(key, value)`
 - `ctx.add(key, delta)`
+- `ctx.top(key, position, type)`
+- `ctx.topServer(key, position, type)`
+- `ctx.topAll(key, position, type)`
+- `ctx.leaderboard(placeholderId, position, periodId, field)`
+- `ctx.leaderboardServer(placeholderId, position, periodId, field)`
+- `ctx.leaderboardAll(placeholderId, position, periodId, field)`
 - `ctx.setLuckPermsContext(key, value)`
 - `ctx.luckPermsContext(key, fallback)`
 - `ctx.removeLuckPermsContext(key)`
+
+Для счётчиков со `serverScoped: true` методы `ctx.setData(...)` и `ctx.add(...)` автоматически пишут данные в локальное хранилище текущего сервера, а чтение через `ctx.data(...)` и `ctx.escore(...)` по умолчанию берёт агрегированное значение со всех серверов.
 
 ## Пример formatter'а поверх собственного счётчика
 
