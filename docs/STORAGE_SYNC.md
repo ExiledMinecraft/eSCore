@@ -77,6 +77,8 @@ MySQL:
 - сгладить burst-изменения;
 - не дёргать базу при каждом событии.
 
+JSON-файл записывается через временный файл и атомарную замену, поэтому аварийная остановка во время сохранения не должна оставлять наполовину записанный JSON. При reload сначала сбрасываются накопленные pending writes, а не отбрасываются.
+
 ## Polling fallback
 
 Для shared backend можно включить database polling fallback.
@@ -88,6 +90,8 @@ MySQL:
 - `eSCore` может периодически опрашивать backend на предмет remote updates.
 
 Это не так быстро, как Redis runtime sync, но даёт рабочую синхронизацию для shared storage.
+
+Удаления в SQL сохраняются как `null`-tombstone с timestamp: иначе удалённая строка исчезла бы до того, как другие серверы увидят изменение. Параметр `sync.database-poll-overlap-millis` задаёт небольшое перекрытие окон polling, чтобы не пропустить транзакцию, которая началась до опроса, но завершилась после него. Повторно увиденные записи отсекаются по timestamp.
 
 ## Redis runtime sync
 
@@ -249,3 +253,28 @@ serverScoped: true
 - MySQL + Redis для нескольких;
 - backend persistence только для тех скриптов, которым это действительно нужно;
 - новые имена `escore`, а не `wscore`.
+
+## TTL, namespaces и перенос данных
+
+Публичный API поддерживает изолированные пространства ключей:
+
+```java
+var storage = eScoreProvider.get().storage("my-plugin");
+storage.set(playerId, "session", value, Duration.ofMinutes(10));
+Object value = storage.get(playerId, "session", null);
+```
+
+TTL хранится в JSON, SQLite и MySQL и передаётся через Redis. Старые SQL-таблицы автоматически получают колонку `expires_at`, а старые JSON-файлы читаются с бесконечным TTL.
+
+Настраиваемые лимиты защищают от чрезмерного числа ключей, длинных имён, больших значений и слишком крупных batch-запросов.
+
+```text
+/escore storage status
+/escore storage flush
+/escore storage export <name>
+/escore storage import <name> --confirm
+```
+
+Файлы переноса находятся в `plugins/eSCore/exports`. Import выполняет контролируемое слияние и требует явного `--confirm`. Формат содержит `schemaVersion`, поэтому несовместимый экспорт не применяется молча.
+
+Redis subscriber после разрыва соединения восстанавливается с экспоненциальной задержкой до 30 секунд; его состояние видно в `/escore diagnose`.

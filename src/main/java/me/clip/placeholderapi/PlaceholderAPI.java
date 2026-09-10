@@ -8,13 +8,14 @@ import me.clip.placeholderapi.replacer.CharsReplacer;
 import me.clip.placeholderapi.replacer.Replacer;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 public final class PlaceholderAPI {
     private static final Replacer REPLACER_PERCENT = new CharsReplacer(Replacer.Closure.PERCENT);
@@ -22,13 +23,14 @@ public final class PlaceholderAPI {
     private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("[%]([^%]+)[%]");
     private static final Pattern BRACKET_PLACEHOLDER_PATTERN = Pattern.compile("[{]([^{}]+)[}]");
     private static final Pattern RELATIONAL_PLACEHOLDER_PATTERN = Pattern.compile("[%](rel_)([^%]+)[%]");
+    private static final Map<String, PlaceholderHook> LEGACY_HOOKS = new ConcurrentHashMap<>();
 
     private PlaceholderAPI() {
     }
 
     public static String setPlaceholders(OfflinePlayer player, String text) {
         PlaceholderAPIPlugin plugin = PlaceholderAPIPlugin.getInstance();
-        return plugin == null ? text : REPLACER_PERCENT.apply(text, player, plugin.getLocalExpansionManager()::getExpansion);
+        return plugin == null ? text : applyPasses(REPLACER_PERCENT, player, text, plugin);
     }
 
     public static List<String> setPlaceholders(OfflinePlayer player, List<String> text) {
@@ -49,7 +51,7 @@ public final class PlaceholderAPI {
 
     public static String setBracketPlaceholders(OfflinePlayer player, String text) {
         PlaceholderAPIPlugin plugin = PlaceholderAPIPlugin.getInstance();
-        return plugin == null ? text : REPLACER_BRACKET.apply(text, player, plugin.getLocalExpansionManager()::getExpansion);
+        return plugin == null ? text : applyPasses(REPLACER_BRACKET, player, text, plugin);
     }
 
     public static List<String> setBracketPlaceholders(OfflinePlayer player, List<String> text) {
@@ -69,6 +71,10 @@ public final class PlaceholderAPI {
     }
 
     public static String setRelationalPlaceholders(Player one, Player two, String text) {
+        PlaceholderAPIPlugin plugin = PlaceholderAPIPlugin.getInstance();
+        if (plugin == null || text == null || text.isEmpty()) {
+            return text;
+        }
         Matcher matcher = RELATIONAL_PLACEHOLDER_PATTERN.matcher(text);
         while (matcher.find()) {
             String format = matcher.group(2);
@@ -79,8 +85,7 @@ public final class PlaceholderAPI {
 
             String identifier = format.substring(0, index).toLowerCase(Locale.ROOT);
             String params = format.substring(index + 1);
-            PlaceholderExpansion expansion = PlaceholderAPIPlugin.getInstance()
-                    .getLocalExpansionManager()
+            PlaceholderExpansion expansion = plugin.getLocalExpansionManager()
                     .getExpansion(identifier);
             if (!(expansion instanceof Relational relational)) {
                 continue;
@@ -104,12 +109,22 @@ public final class PlaceholderAPI {
 
     public static boolean isRegistered(String identifier) {
         PlaceholderAPIPlugin plugin = PlaceholderAPIPlugin.getInstance();
-        return plugin != null && plugin.getLocalExpansionManager().findExpansionByIdentifier(identifier).isPresent();
+        if (plugin == null || identifier == null) {
+            return false;
+        }
+        String normalized = identifier.trim().toLowerCase(Locale.ROOT);
+        return plugin.getLocalExpansionManager().findExpansionByIdentifier(normalized).isPresent()
+                || LEGACY_HOOKS.containsKey(normalized);
     }
 
     public static Set<String> getRegisteredIdentifiers() {
         PlaceholderAPIPlugin plugin = PlaceholderAPIPlugin.getInstance();
-        return plugin == null ? Set.of() : plugin.getLocalExpansionManager().getIdentifiers();
+        if (plugin == null) {
+            return Set.of();
+        }
+        Set<String> identifiers = new java.util.LinkedHashSet<>(plugin.getLocalExpansionManager().getIdentifiers());
+        identifiers.addAll(LEGACY_HOOKS.keySet());
+        return Set.copyOf(identifiers);
     }
 
     public static Pattern getPlaceholderPattern() {
@@ -156,28 +171,33 @@ public final class PlaceholderAPI {
         if (plugin == null) {
             return Map.of();
         }
-        return plugin.getLocalExpansionManager().getExpansions().stream()
-                .collect(Collectors.toMap(me.clip.placeholderapi.expansion.PlaceholderExpansion::getIdentifier, expansion -> expansion));
+        Map<String, PlaceholderHook> hooks = new LinkedHashMap<>(LEGACY_HOOKS);
+        plugin.getLocalExpansionManager().getExpansions()
+                .forEach(expansion -> hooks.put(expansion.getIdentifier().toLowerCase(Locale.ROOT), expansion));
+        return Map.copyOf(hooks);
     }
 
     @Deprecated
     public static boolean registerPlaceholderHook(org.bukkit.plugin.Plugin plugin, PlaceholderHook placeholderHook) {
-        return false;
+        return plugin != null && registerPlaceholderHook(plugin.getName(), placeholderHook);
     }
 
     @Deprecated
     public static boolean registerPlaceholderHook(String identifier, PlaceholderHook placeholderHook) {
-        return false;
+        if (identifier == null || identifier.isBlank() || placeholderHook == null) {
+            return false;
+        }
+        return LEGACY_HOOKS.putIfAbsent(identifier.trim().toLowerCase(Locale.ROOT), placeholderHook) == null;
     }
 
     @Deprecated
     public static boolean unregisterPlaceholderHook(org.bukkit.plugin.Plugin plugin) {
-        return false;
+        return plugin != null && unregisterPlaceholderHook(plugin.getName());
     }
 
     @Deprecated
     public static boolean unregisterPlaceholderHook(String identifier) {
-        return false;
+        return identifier != null && LEGACY_HOOKS.remove(identifier.trim().toLowerCase(Locale.ROOT)) != null;
     }
 
     @Deprecated
@@ -187,7 +207,7 @@ public final class PlaceholderAPI {
 
     @Deprecated
     public static Set<String> getExternalPlaceholderPlugins() {
-        return Set.of();
+        return Set.copyOf(LEGACY_HOOKS.keySet());
     }
 
     @Deprecated
@@ -208,5 +228,35 @@ public final class PlaceholderAPI {
     @Deprecated
     public static List<String> setPlaceholders(OfflinePlayer player, List<String> text, Pattern pattern) {
         return setPlaceholders(player, text);
+    }
+
+    static void clearLegacyHooks() {
+        LEGACY_HOOKS.clear();
+    }
+
+    private static PlaceholderHook findHook(String identifier) {
+        PlaceholderAPIPlugin plugin = PlaceholderAPIPlugin.getInstance();
+        if (plugin == null) {
+            return null;
+        }
+        PlaceholderExpansion expansion = plugin.getLocalExpansionManager().getExpansion(identifier);
+        return expansion == null ? LEGACY_HOOKS.get(identifier) : expansion;
+    }
+
+    private static String applyPasses(Replacer replacer, OfflinePlayer player, String text, PlaceholderAPIPlugin plugin) {
+        if (text == null || text.isEmpty()) {
+            return text;
+        }
+        int maxPasses = Math.max(1, Math.min(16, plugin.getConfig().getInt("placeholderapi.parser.max-passes", 2)));
+        String current = text;
+        Set<String> seen = new java.util.HashSet<>();
+        for (int pass = 0; pass < maxPasses && seen.add(current); pass++) {
+            String replaced = replacer.apply(current, player, PlaceholderAPI::findHook);
+            if (replaced.equals(current)) {
+                break;
+            }
+            current = replaced;
+        }
+        return current;
     }
 }

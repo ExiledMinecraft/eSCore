@@ -44,8 +44,11 @@ public final class MysqlStorageBackend extends AbstractJdbcStorageBackend {
 
     @Override
     protected String upsertSql() {
-        return "INSERT INTO " + tableName() + " (player_uuid, data_key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
-                "ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)";
+        return "INSERT INTO " + tableName() + " (player_uuid, data_key, value_json, updated_at, expires_at) VALUES (?, ?, ?, ?, ?) " +
+                "ON DUPLICATE KEY UPDATE " +
+                "value_json = IF(VALUES(updated_at) >= updated_at, VALUES(value_json), value_json), " +
+                "expires_at = IF(VALUES(updated_at) >= updated_at, VALUES(expires_at), expires_at), " +
+                "updated_at = GREATEST(updated_at, VALUES(updated_at))";
     }
 
     @Override

@@ -7,6 +7,7 @@ import org.bukkit.plugin.EventExecutor;
 import ru.exiledproject.developments.api.eScoreApi;
 import ru.exiledproject.developments.api.eScoreEventBridge;
 import ru.exiledproject.developments.api.eScorePlaceholderHook;
+import ru.exiledproject.developments.api.eScorePlaceholderResult;
 import ru.exiledproject.developments.api.eScoreRegistration;
 import ru.exiledproject.developments.api.eScoreScope;
 import ru.exiledproject.developments.api.eScoreValueProvider;
@@ -17,11 +18,15 @@ import ru.exiledproject.developments.script.ScriptManager;
 
 import java.util.ArrayDeque;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Locale;
 import java.util.Optional;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.time.Duration;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class eScoreApiImpl implements eScoreApi {
@@ -70,6 +75,23 @@ public final class eScoreApiImpl implements eScoreApi {
     }
 
     @Override
+    public void setPlayerValue(UUID playerId, String key, Object value, Duration ttl) {
+        Objects.requireNonNull(ttl, "ttl");
+        long expiresAt = ttl.isZero() || ttl.isNegative() ? 0L : Math.addExact(System.currentTimeMillis(), ttl.toMillis());
+        dataStore.setValue(playerId, resolveWriteKey(key), value, ru.exiledproject.developments.data.ChangeOrigin.LOCAL,
+                System.currentTimeMillis(), expiresAt);
+    }
+
+    @Override
+    public void setPlayerValues(UUID playerId, Map<String, ?> values) {
+        Objects.requireNonNull(values, "values");
+        if (values.size() > plugin.getConfig().getInt("storage.limits.max-batch-size", 1000)) {
+            throw new IllegalArgumentException("Storage batch exceeds configured limit.");
+        }
+        values.forEach((key, value) -> setPlayerValue(playerId, key, value));
+    }
+
+    @Override
     public double addToPlayerNumber(UUID playerId, String key, double delta) {
         return dataStore.addToPlayerNumber(playerId, resolveWriteKey(key), delta);
     }
@@ -81,15 +103,22 @@ public final class eScoreApiImpl implements eScoreApi {
 
     @Override
     public Optional<String> resolvePlaceholder(OfflinePlayer player, String placeholderId, eScoreScope scope) {
+        eScorePlaceholderResult result = resolvePlaceholderResult(player, placeholderId, scope);
+        return result.hasValue() ? Optional.of(result.value()) : Optional.empty();
+    }
+
+    @Override
+    public eScorePlaceholderResult resolvePlaceholderResult(OfflinePlayer player, String placeholderId, eScoreScope scope) {
         String normalized = normalize(placeholderId);
         if (normalized.isEmpty()) {
-            return Optional.empty();
+            return eScorePlaceholderResult.missing();
         }
 
         ArrayDeque<String> stack = resolutionStack.get();
-        if (stack.contains(normalized)) {
+        int maxDepth = Math.max(1, plugin.getConfig().getInt("placeholderapi.parser.max-recursion-depth", 16));
+        if (stack.size() >= maxDepth || stack.contains(normalized)) {
             log.warn("Placeholder recursion prevented for id: " + normalized);
-            return Optional.empty();
+            return eScorePlaceholderResult.error("Placeholder recursion limit reached: " + normalized);
         }
 
         stack.push(normalized);
@@ -99,10 +128,17 @@ public final class eScoreApiImpl implements eScoreApi {
                 externalHook = externalHooks.get(stripScopeSuffix(normalized));
             }
             if (externalHook != null) {
-                return Optional.ofNullable(externalHook.resolve(player, this));
+                return externalHook.resolveResult(player, this);
             }
             ScriptManager manager = scriptManager;
-            return manager == null ? Optional.empty() : manager.resolvePlaceholder(player, normalized, scope);
+            if (manager == null) {
+                return eScorePlaceholderResult.missing();
+            }
+            return manager.resolvePlaceholder(player, normalized, scope)
+                    .map(eScorePlaceholderResult::text)
+                    .orElseGet(eScorePlaceholderResult::missing);
+        } catch (RuntimeException exception) {
+            return eScorePlaceholderResult.error(exception.getMessage());
         } finally {
             stack.pop();
             if (stack.isEmpty()) {
@@ -143,22 +179,30 @@ public final class eScoreApiImpl implements eScoreApi {
 
     @Override
     public eScoreRegistration registerPlaceholderHook(eScorePlaceholderHook hook) {
+        Objects.requireNonNull(hook, "hook");
         String id = normalize(hook.getId());
+        if (id.isEmpty()) {
+            throw new IllegalArgumentException("Placeholder hook id must not be blank.");
+        }
         externalHooks.put(id, hook);
         log.debug("Registered external placeholder hook: " + id);
         return () -> {
-            externalHooks.remove(id);
+            externalHooks.remove(id, hook);
             log.debug("Unregistered external placeholder hook: " + id);
         };
     }
 
     @Override
     public eScoreRegistration registerValueProvider(eScoreValueProvider provider) {
+        Objects.requireNonNull(provider, "provider");
         String id = normalize(provider.getId());
+        if (id.isEmpty()) {
+            throw new IllegalArgumentException("Value provider id must not be blank.");
+        }
         valueProviders.put(id, provider);
         log.debug("Registered external value provider: " + id);
         return () -> {
-            valueProviders.remove(id);
+            valueProviders.remove(id, provider);
             log.debug("Unregistered external value provider: " + id);
         };
     }
@@ -195,6 +239,11 @@ public final class eScoreApiImpl implements eScoreApi {
 
     @Override
     public void fireChannelEvent(String channel, UUID playerId, Map<String, Object> payload) {
+        if (!org.bukkit.Bukkit.isPrimaryThread()) {
+            Map<String, Object> safePayload = payload == null ? Map.of() : new LinkedHashMap<>(payload);
+            plugin.runSyncIfEnabled(() -> fireChannelEvent(channel, playerId, safePayload));
+            return;
+        }
         ScriptManager manager = scriptManager;
         if (manager != null) {
             manager.handleChannelEvent(channel, playerId, payload == null ? Map.of() : payload);
@@ -216,7 +265,7 @@ public final class eScoreApiImpl implements eScoreApi {
     }
 
     private String normalize(String value) {
-        return value == null ? "" : value.trim().toLowerCase();
+        return value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
     }
 
     private String resolveWriteKey(String key) {

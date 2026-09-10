@@ -96,7 +96,7 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
         if (args.length == 2) {
             return switch (subCommand) {
                 case "info", "unregister" -> filter(args[1], installedIdentifiers());
-                case "ecloud" -> filter(args[1], List.of("status", "refresh", "clear", "enable", "disable", "list", "info", "placeholders", "download", "update"));
+                case "ecloud" -> filter(args[1], List.of("status", "refresh", "clear", "enable", "disable", "list", "info", "placeholders", "download", "update", "verify", "rollback"));
                 default -> List.of();
             };
         }
@@ -109,7 +109,7 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
         if (args.length == 3) {
             return switch (ecloudSub) {
                 case "list" -> filter(args[2], List.of("all", "installed", "search"));
-                case "info", "placeholders", "download" -> filterCloudExpansionNames(args[2]);
+                case "info", "placeholders", "download", "rollback" -> filterCloudExpansionNames(args[2]);
                 case "update" -> filter(args[2], updatableExpansionSuggestions());
                 default -> List.of();
             };
@@ -432,6 +432,8 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
             case "placeholders" -> handleEcloudPlaceholders(sender, args);
             case "download" -> handleEcloudDownload(sender, args);
             case "update" -> handleEcloudUpdate(sender, args);
+            case "verify" -> handleEcloudVerify(sender);
+            case "rollback" -> handleEcloudRollback(sender, args);
             default -> {
                 sendEcloudHelp(sender);
                 yield true;
@@ -608,7 +610,8 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
         }
 
         String name = args[2];
-        String version = args.length >= 4 ? args[3] : "";
+        boolean dryRun = java.util.Arrays.stream(args).anyMatch("--dry-run"::equalsIgnoreCase);
+        String version = args.length >= 4 && !args[3].startsWith("--") ? args[3] : "";
         Path targetDirectory = plugin.getPlaceholderApiExpansionsDirectory();
         runAsync(() -> {
             CloudExpansionManager cloud = plugin.getPlaceholderCompatManager().getCloudExpansionManager();
@@ -622,7 +625,7 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
                 return;
             }
 
-            CloudExpansionManager.DownloadResult result = cloud.download(name, version, targetDirectory);
+            CloudExpansionManager.DownloadResult result = cloud.download(name, version, targetDirectory, dryRun);
             runSync(() -> {
                 if (!result.success()) {
                     sendLine(sender, "Failed to download expansion: " + result.message());
@@ -630,8 +633,43 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
                     return;
                 }
 
-                sendLine(sender, "Successfully downloaded expansion " + cloudExpansion.get().getName() + " to file: " + result.file().getFileName());
-                sendLine(sender, "Make sure to type /papi reload to enable your new expansion.");
+                if (dryRun) {
+                    sendLine(sender, result.message());
+                } else {
+                    sendLine(sender, "Successfully downloaded expansion " + cloudExpansion.get().getName() + " to file: " + result.file().getFileName());
+                    sendLine(sender, "Make sure to type /papi reload to enable your new expansion.");
+                }
+            });
+        });
+        return true;
+    }
+
+    private boolean handleEcloudVerify(CommandSender sender) {
+        runAsync(() -> {
+            List<String> results = plugin.getPlaceholderCompatManager().getCloudExpansionManager()
+                    .verifyInstalled(plugin.getPlaceholderApiExpansionsDirectory());
+            runSync(() -> {
+                sendLine(sender, "eCloud verification:");
+                results.forEach(result -> sendLine(sender, result));
+            });
+        });
+        return true;
+    }
+
+    private boolean handleEcloudRollback(CommandSender sender, String[] args) {
+        if (args.length < 3) {
+            sendLine(sender, "Usage: /papi ecloud rollback <name>");
+            return true;
+        }
+        String name = args[2];
+        runAsync(() -> {
+            CloudExpansionManager.DownloadResult result = plugin.getPlaceholderCompatManager().getCloudExpansionManager()
+                    .rollback(name, plugin.getPlaceholderApiExpansionsDirectory());
+            runSync(() -> {
+                sendLine(sender, result.message());
+                if (result.success()) {
+                    plugin.getPlaceholderCompatManager().getLocalExpansionManager().loadExpansionJar(result.file());
+                }
             });
         });
         return true;
@@ -663,22 +701,35 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
 
             Path targetDirectory = plugin.getPlaceholderApiExpansionsDirectory();
             List<String> results = new ArrayList<>();
+            List<DownloadedExpansion> downloads = new ArrayList<>();
             for (CloudExpansion expansion : targets) {
                 CloudExpansionManager.DownloadResult result = cloud.download(expansion.getName(), "", targetDirectory);
                 if (!result.success()) {
                     results.add(expansion.getName() + ": failed - " + result.message());
                     continue;
                 }
-                List<PlaceholderExpansion> loaded = plugin.getPlaceholderCompatManager().getLocalExpansionManager().loadExpansionJar(result.file());
-                if (loaded.isEmpty()) {
-                    results.add(expansion.getName() + ": downloaded, but nothing was registered yet.");
-                    continue;
-                }
-                String versions = String.join(", ", loaded.stream().map(loadedExpansion -> loadedExpansion.getIdentifier() + " [" + loadedExpansion.getVersion() + "]").toList());
-                results.add(expansion.getName() + ": updated -> " + versions);
+                downloads.add(new DownloadedExpansion(expansion.getName(), result.file()));
             }
 
             runSync(() -> {
+                for (DownloadedExpansion download : downloads) {
+                    List<PlaceholderExpansion> loaded = plugin.getPlaceholderCompatManager().getLocalExpansionManager().loadExpansionJar(download.file());
+                    if (loaded.isEmpty()) {
+                        results.add(download.name() + ": registration failed; rollback scheduled.");
+                        runAsync(() -> {
+                            CloudExpansionManager.DownloadResult rollback = cloud.rollback(download.name(), targetDirectory);
+                            runSync(() -> {
+                                if (rollback.success()) {
+                                    plugin.getPlaceholderCompatManager().getLocalExpansionManager().loadExpansionJar(rollback.file());
+                                }
+                                sendLine(sender, download.name() + ": " + rollback.message());
+                            });
+                        });
+                        continue;
+                    }
+                    String versions = String.join(", ", loaded.stream().map(loadedExpansion -> loadedExpansion.getIdentifier() + " [" + loadedExpansion.getVersion() + "]").toList());
+                    results.add(download.name() + ": updated -> " + versions);
+                }
                 sendLine(sender, "Update results:");
                 results.forEach(line -> sendLine(sender, line));
                 refreshResult.errors().forEach(error -> sendLine(sender, "eCloud: " + error));
@@ -724,7 +775,10 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
         sendLine(sender, "&e/papi ecloud info <name> [version]");
         sendLine(sender, "&e/papi ecloud placeholders <name>");
         sendLine(sender, "&e/papi ecloud download <name> [version]");
+        sendLine(sender, "&e/papi ecloud download <name> [version] --dry-run");
         sendLine(sender, "&e/papi ecloud update <all|name>");
+        sendLine(sender, "&e/papi ecloud verify");
+        sendLine(sender, "&e/papi ecloud rollback <name>");
     }
 
     private @Nullable OfflinePlayer resolveOfflinePlayer(CommandSender sender, String token) {
@@ -822,9 +876,10 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
         }
 
         LinkedHashSet<String> possible = new LinkedHashSet<>(expansion.getPlaceholders());
-        plugin.getPlaceholderCompatManager().getCloudExpansionManager()
-                .findCloudExpansionByName(expansion.getName())
-                .ifPresent(cloud -> possible.addAll(cloud.getPlaceholders()));
+        CloudExpansionManager cloud = plugin.getPlaceholderCompatManager().getCloudExpansionManager();
+        cloud.findCachedCloudExpansionByName(expansion.getName())
+                .ifPresent(cached -> possible.addAll(cached.getPlaceholders()));
+        cloud.warmupAsync();
         return filter(token, new ArrayList<>(possible));
     }
 
@@ -1038,5 +1093,8 @@ public final class PapiCommand implements CommandExecutor, TabCompleter {
     }
 
     private record EcloudListRequest(String mode, String query, int page) {
+    }
+
+    private record DownloadedExpansion(String name, Path file) {
     }
 }

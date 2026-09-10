@@ -1,1 +1,6 @@
 rootProject.name = 'eSCore'
+
+include('escore-api')
+include('escore-storage')
+include('escore-scripting-js')
+include('extensions:wscore-worldguard')

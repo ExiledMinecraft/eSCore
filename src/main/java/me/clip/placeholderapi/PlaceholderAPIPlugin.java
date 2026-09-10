@@ -39,6 +39,7 @@ public final class PlaceholderAPIPlugin extends eSCorePlugin {
         try {
             super.onDisable();
         } finally {
+            PlaceholderAPI.clearLegacyHooks();
             instance = null;
         }
     }

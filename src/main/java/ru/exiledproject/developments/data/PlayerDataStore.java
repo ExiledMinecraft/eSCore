@@ -10,6 +10,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -43,7 +44,12 @@ public final class PlayerDataStore {
         clear();
         snapshot.forEach((playerId, values) -> {
             Map<String, ValueHolder> playerValues = new ConcurrentHashMap<>();
-            values.forEach((key, persistedValue) -> playerValues.put(normalizeKey(key), new ValueHolder(normalizeValue(persistedValue.value()), persistedValue.updatedAt())));
+            values.forEach((key, persistedValue) -> {
+                Object value = normalizeValue(persistedValue.value());
+                if (value != null && !persistedValue.isExpired(System.currentTimeMillis())) {
+                    playerValues.put(normalizeKey(key), new ValueHolder(value, persistedValue.updatedAt(), persistedValue.expiresAt()));
+                }
+            });
             if (!playerValues.isEmpty()) {
                 data.put(playerId, playerValues);
             }
@@ -58,7 +64,9 @@ public final class PlayerDataStore {
             Map<String, PersistedValue> playerValues = new LinkedHashMap<>();
             values.forEach((key, holder) -> {
                 if (normalizedKeys.isEmpty() || normalizedKeys.contains(key)) {
-                    playerValues.put(key, new PersistedValue(holder.value(), holder.updatedAt()));
+                    if (!holder.isExpired(System.currentTimeMillis())) {
+                        playerValues.put(key, new PersistedValue(holder.value(), holder.updatedAt(), holder.expiresAt()));
+                    }
                 }
             });
             if (!playerValues.isEmpty()) {
@@ -77,7 +85,9 @@ public final class PlayerDataStore {
         Map<String, PersistedValue> snapshot = new LinkedHashMap<>();
         values.forEach((key, holder) -> {
             if (normalizedKeys.isEmpty() || normalizedKeys.contains(key)) {
-                snapshot.put(key, new PersistedValue(holder.value(), holder.updatedAt()));
+                if (!holder.isExpired(System.currentTimeMillis())) {
+                    snapshot.put(key, new PersistedValue(holder.value(), holder.updatedAt(), holder.expiresAt()));
+                }
             }
         });
         return snapshot;
@@ -86,6 +96,7 @@ public final class PlayerDataStore {
     public Object getValue(UUID playerId, String key, Object defaultValue) {
         String normalizedKey = normalizeKey(key);
         Map<String, ValueHolder> values = data.getOrDefault(playerId, Collections.emptyMap());
+        purgeExpired(values);
         if (StorageScopeKeys.isServerScopedKey(normalizedKey)) {
             ValueHolder holder = values.get(normalizedKey);
             if (holder != null) {
@@ -106,6 +117,7 @@ public final class PlayerDataStore {
     public Object getValue(UUID playerId, String key, Object defaultValue, eScoreScope scope, String serverId) {
         String normalizedKey = normalizeKey(key);
         Map<String, ValueHolder> values = data.getOrDefault(playerId, Collections.emptyMap());
+        purgeExpired(values);
         ValueHolder direct = values.get(normalizedKey);
         if (scope == eScoreScope.CURRENT_SERVER && StorageScopeKeys.isServerScopedKey(normalizedKey)) {
             return direct == null ? defaultValue : direct.value();
@@ -116,14 +128,20 @@ public final class PlayerDataStore {
 
     public PersistedValue getPersistedValue(UUID playerId, String key) {
         ValueHolder holder = data.getOrDefault(playerId, Collections.emptyMap()).get(normalizeKey(key));
-        return holder == null ? null : new PersistedValue(holder.value(), holder.updatedAt());
+        if (holder == null || holder.isExpired(System.currentTimeMillis())) {
+            return null;
+        }
+        return new PersistedValue(holder.value(), holder.updatedAt(), holder.expiresAt());
     }
 
     public double addToPlayerNumber(UUID playerId, String key, double delta) {
-        double current = toNumber(getValue(playerId, key, 0D));
-        double updated = current + delta;
-        setValue(playerId, key, updated);
-        return updated;
+        Map<String, ValueHolder> playerValues = data.computeIfAbsent(playerId, ignored -> new ConcurrentHashMap<>());
+        synchronized (playerValues) {
+            double current = toNumber(getValue(playerId, key, 0D));
+            double updated = current + delta;
+            setValue(playerId, key, updated);
+            return updated;
+        }
     }
 
     public void setValue(UUID playerId, String key, Object value) {
@@ -131,25 +149,44 @@ public final class PlayerDataStore {
     }
 
     public void setValue(UUID playerId, String key, Object value, ChangeOrigin origin, long updatedAt) {
+        setValue(playerId, key, value, origin, updatedAt, 0L);
+    }
+
+    public void setValue(UUID playerId, String key, Object value, ChangeOrigin origin, long updatedAt, long expiresAt) {
         String normalizedKey = normalizeKey(key);
+        int maximumKeyLength = Math.max(16, plugin.getConfig().getInt("storage.limits.max-key-length", 128));
+        if (normalizedKey.isBlank() || normalizedKey.length() > maximumKeyLength) {
+            throw new IllegalArgumentException("Storage key is blank or exceeds " + maximumKeyLength + " characters.");
+        }
         Map<String, ValueHolder> values = data.computeIfAbsent(playerId, ignored -> new ConcurrentHashMap<>());
         ValueHolder oldHolder = values.get(normalizedKey);
         Object oldValue = oldHolder == null ? null : oldHolder.value();
         long previousUpdatedAt = oldHolder == null ? 0L : oldHolder.updatedAt();
 
-        if (oldHolder != null && origin != ChangeOrigin.LOCAL && updatedAt < previousUpdatedAt) {
+        if (oldHolder != null && origin != ChangeOrigin.LOCAL && updatedAt <= previousUpdatedAt) {
             return;
         }
 
         topCache.clear();
         Object newValue = normalizeValue(value);
+        if (newValue != null) {
+            int maximumBytes = Math.max(1024, plugin.getConfig().getInt("storage.limits.max-value-bytes", 65_536));
+            int valueBytes = String.valueOf(newValue).getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+            if (valueBytes > maximumBytes) {
+                throw new IllegalArgumentException("Storage value exceeds " + maximumBytes + " bytes.");
+            }
+            int maximumKeys = Math.max(1, plugin.getConfig().getInt("storage.limits.max-keys-per-player", 2048));
+            if (!values.containsKey(normalizedKey) && values.size() >= maximumKeys) {
+                throw new IllegalStateException("Player storage key limit reached (" + maximumKeys + ").");
+            }
+        }
         if (newValue == null) {
             values.remove(normalizedKey);
             if (values.isEmpty()) {
                 data.remove(playerId);
             }
         } else {
-            values.put(normalizedKey, new ValueHolder(newValue, updatedAt));
+            values.put(normalizedKey, new ValueHolder(newValue, updatedAt, Math.max(0L, expiresAt)));
         }
 
         if (!Objects.equals(oldValue, newValue) || previousUpdatedAt != updatedAt) {
@@ -163,6 +200,7 @@ public final class PlayerDataStore {
     }
 
     public List<Map.Entry<UUID, Double>> getTopNumbers(String key, int limit, eScoreScope scope, String serverId) {
+        purgeAllExpired();
         String normalizedKey = normalizeKey(key);
         String cacheKey = topCacheKey(normalizedKey, scope, serverId);
         List<Map.Entry<UUID, Double>> entries = topCache.computeIfAbsent(cacheKey, ignored -> computeTopNumbers(normalizedKey, scope, serverId));
@@ -229,7 +267,7 @@ public final class PlayerDataStore {
     }
 
     private static String normalizeKey(String key) {
-        return key == null ? "" : key.trim().toLowerCase();
+        return key == null ? "" : key.trim().toLowerCase(Locale.ROOT);
     }
 
     private static double toNumber(Object value) {
@@ -262,7 +300,23 @@ public final class PlayerDataStore {
     }
 
     private static String topCacheKey(String key, eScoreScope scope, String serverId) {
-        return scope.name() + "::" + (serverId == null ? "" : serverId.toLowerCase()) + "::" + StorageScopeKeys.logicalKey(key);
+        return scope.name() + "::" + (serverId == null ? "" : serverId.toLowerCase(Locale.ROOT)) + "::" + StorageScopeKeys.logicalKey(key);
+    }
+
+    private void purgeExpired(Map<String, ValueHolder> values) {
+        long now = System.currentTimeMillis();
+        if (values.entrySet().removeIf(entry -> entry.getValue().isExpired(now))) {
+            topCache.clear();
+        }
+    }
+
+    private void purgeAllExpired() {
+        data.forEach((playerId, values) -> {
+            purgeExpired(values);
+            if (values.isEmpty()) {
+                data.remove(playerId, values);
+            }
+        });
     }
 
     private Object normalizeValue(Object value) {
@@ -297,7 +351,10 @@ public final class PlayerDataStore {
         return String.valueOf(value);
     }
 
-    private record ValueHolder(Object value, long updatedAt) {
+    private record ValueHolder(Object value, long updatedAt, long expiresAt) {
+        private boolean isExpired(long now) {
+            return expiresAt > 0L && expiresAt <= now;
+        }
     }
 
     private record AggregatedValue(Object value, long updatedAt) {

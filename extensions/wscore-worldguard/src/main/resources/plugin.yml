@@ -1,11 +1,12 @@
-name: WScoreWorldGuard
+name: eSCoreWorldGuard
 version: '${version}'
 main: ru.willowstudio.wscore.worldguard.WScoreWorldGuardPlugin
 api-version: '1.20'
 authors: [WillowStudio]
 website: https://willowstudio.ru
-description: WorldGuard integration bridge for WScore.
+description: WorldGuard integration bridge for eSCore.
+provides:
+  - WScoreWorldGuard
 depend:
-  - WScore
+  - eSCore
   - WorldGuard
-

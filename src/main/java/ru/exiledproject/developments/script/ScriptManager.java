@@ -16,9 +16,11 @@ import org.bukkit.permissions.PermissionDefault;
 import org.bukkit.plugin.EventExecutor;
 import org.bukkit.projectiles.ProjectileSource;
 import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.Engine;
 import org.graalvm.polyglot.HostAccess;
 import org.graalvm.polyglot.Source;
 import org.graalvm.polyglot.Value;
+import ru.exiledproject.developments.scripting.js.JsSandbox;
 import ru.exiledproject.developments.api.eScoreApi;
 import ru.exiledproject.developments.api.eScoreScope;
 import ru.exiledproject.developments.core.eScoreLogger;
@@ -52,6 +54,11 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class ScriptManager {
@@ -117,6 +124,9 @@ public final class ScriptManager {
     private final PlayerDataStore dataStore;
     private final eScoreApi api;
     private final eScoreLogger log;
+    private final Engine jsEngine;
+    private final ScheduledExecutorService scriptWatchdog;
+    private final Object scriptExecutionLock = new Object();
     private final Listener bridgeListener = new Listener() {
     };
     private final ThreadLocal<ArrayDeque<String>> placeholderStack = ThreadLocal.withInitial(ArrayDeque::new);
@@ -138,6 +148,12 @@ public final class ScriptManager {
         this.dataStore = dataStore;
         this.api = api;
         this.log = log;
+        this.jsEngine = JsSandbox.createEngine();
+        this.scriptWatchdog = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "eSCore-JS-Watchdog");
+            thread.setDaemon(true);
+            return thread;
+        });
     }
 
     public synchronized ScriptLoadReport reload() {
@@ -202,12 +218,10 @@ public final class ScriptManager {
         Object sourceValue = resolveBaseValue(script, player, eScoreScope.ALL_SERVERS);
         ScriptInvocationContext context = new ScriptInvocationContext(script, player, sourceValue);
         try {
-            synchronized (script.runtime()) {
-                if (script.contextFunction() != null) {
-                    return Optional.ofNullable(convertValue(script.contextFunction().execute(sourceValue, context)));
-                }
-                return Optional.ofNullable(script.contextValue());
+            if (script.contextFunction() != null) {
+                return Optional.ofNullable(executeFunction(script, script.contextFunction(), sourceValue, context));
             }
+            return Optional.ofNullable(script.contextValue());
         } catch (Exception exception) {
             log.debug("Failed to resolve script context for " + script.id() + ": " + exception.getMessage());
             return Optional.empty();
@@ -255,7 +269,9 @@ public final class ScriptManager {
                     + ": calls=" + snapshot.calls()
                     + ", total=" + new DecimalFormat("0.00").format(snapshot.totalMillis()) + "ms"
                     + ", avg=" + new DecimalFormat("0.00").format(snapshot.avgMillis()) + "ms"
-                    + ", max=" + new DecimalFormat("0.00").format(snapshot.maxMillis()) + "ms");
+                    + ", max=" + new DecimalFormat("0.00").format(snapshot.maxMillis()) + "ms"
+                    + ", cache=" + snapshot.cacheHits() + "/" + (snapshot.cacheHits() + snapshot.cacheMisses())
+                    + ", errors=" + snapshot.errors());
         }
         return lines;
     }
@@ -278,12 +294,29 @@ public final class ScriptManager {
             double avgMillis = entry.getValue().totalNanos().get() / 1_000_000D / calls;
             double totalMillis = entry.getValue().totalNanos().get() / 1_000_000D;
             double maxMillis = entry.getValue().maxNanos().get() / 1_000_000D;
-            snapshots.add(new ScriptProfileSnapshot(entry.getKey(), calls, totalMillis, avgMillis, maxMillis));
+            snapshots.add(new ScriptProfileSnapshot(entry.getKey(), calls, totalMillis, avgMillis, maxMillis,
+                    entry.getValue().cacheHits().get(), entry.getValue().cacheMisses().get(), entry.getValue().errors().get()));
             if (snapshots.size() >= Math.max(1, limit)) {
                 break;
             }
         }
         return snapshots;
+    }
+
+    public List<String> getRuntimeStatusLines() {
+        Set<ScriptRuntime> uniqueRuntimes = new LinkedHashSet<>(runtimes);
+        long healthy = uniqueRuntimes.stream().filter(ScriptRuntime::healthy).count();
+        long timeouts = uniqueRuntimes.stream().mapToLong(ScriptRuntime::timeoutCount).sum();
+        long hits = profiles.values().stream().mapToLong(profile -> profile.cacheHits().get()).sum();
+        long misses = profiles.values().stream().mapToLong(profile -> profile.cacheMisses().get()).sum();
+        long errors = profiles.values().stream().mapToLong(profile -> profile.errors().get()).sum();
+        return List.of(
+                "Scripts: " + scripts.size() + ", files: " + uniqueRuntimes.size(),
+                "JS contexts: healthy=" + healthy + ", disabled=" + (uniqueRuntimes.size() - healthy) + ", timeouts=" + timeouts,
+                "Placeholder cache: entries=" + placeholderCache.size() + ", hits=" + hits + ", misses=" + misses,
+                "Source cache: entries=" + sourceCache.size() + ", errors=" + errors,
+                "Graal engine: " + jsEngine.getImplementationName() + " " + jsEngine.getVersion()
+        );
     }
 
     public void onPlayerValueChange(PlayerValueChange change) {
@@ -332,6 +365,8 @@ public final class ScriptManager {
         placeholderCache.clear();
         sourceCache.clear();
         profiles.clear();
+        scriptWatchdog.shutdownNow();
+        jsEngine.close(true);
     }
 
     private ScriptLoadReport buildCandidate(boolean activate) {
@@ -426,7 +461,7 @@ public final class ScriptManager {
             report.error("Cannot read scripts directory: " + exception.getMessage());
         }
 
-        if (activate) {
+        if (activate && !report.hasErrors()) {
             swapState(newScripts, newAliases, newChannelWatchers, newDependentPlaceholders, newDataKeyDependents, newStorageKeyOwners, eventBindings, newRuntimes);
         } else {
             for (ScriptRuntime runtime : newRuntimes) {
@@ -539,21 +574,30 @@ public final class ScriptManager {
 
     private CompiledScriptFile compileFile(Path file) throws IOException {
         String sourceCode = Files.readString(file);
-        Context context = Context.newBuilder("js")
-                .allowExperimentalOptions(true)
-                .allowHostAccess(HostAccess.ALL)
-                .allowHostClassLookup(className -> false)
-                .option("engine.WarnInterpreterOnly", "false")
+        Context context = JsSandbox.context(jsEngine, createRestrictedHostAccess())
                 .option("js.ecmascript-version", "2022")
-                .option("js.nashorn-compat", "true")
+                .option("js.nashorn-compat", plugin.getConfig().getBoolean("scripts.runtime.nashorn-compat", false) ? "true" : "false")
                 .build();
 
-        ScriptRuntime runtime = new ScriptRuntime(file, context);
+        long executionLimit = Math.max(1L, plugin.getConfig().getLong("scripts.runtime.max-execution-millis", 25L));
+        long loadLimit = Math.max(executionLimit, plugin.getConfig().getLong("scripts.runtime.max-load-millis", 1000L));
+        ScriptRuntime runtime = new ScriptRuntime(file, context, scriptWatchdog, scriptExecutionLock, executionLimit);
         ScriptBootstrap bootstrap = new ScriptBootstrap(runtime, plugin.getScriptsDirectory(), log);
-        context.getBindings("js").putMember("wscore", bootstrap);
-        context.getBindings("js").putMember("escore", bootstrap);
-        context.eval(Source.newBuilder("js", BOOTSTRAP_PRELUDE, "escore-bootstrap.js").buildLiteral());
-        context.eval(Source.newBuilder("js", sourceCode, file.getFileName().toString()).build());
+        try {
+            runtime.call(loadLimit, () -> {
+                context.getBindings("js").putMember("wscore", bootstrap);
+                context.getBindings("js").putMember("escore", bootstrap);
+                context.eval(Source.newBuilder("js", BOOTSTRAP_PRELUDE, "escore-bootstrap.js").buildLiteral());
+                context.eval(Source.newBuilder("js", sourceCode, file.getFileName().toString()).build());
+                return null;
+            });
+        } catch (Exception exception) {
+            runtime.close();
+            if (exception instanceof IOException ioException) {
+                throw ioException;
+            }
+            throw new IOException("JavaScript load failed: " + exception.getMessage(), exception);
+        }
 
         List<eScoreScript> loadedScripts = new ArrayList<>();
         int watcherCount = 0;
@@ -563,6 +607,16 @@ public final class ScriptManager {
             watcherCount += script.watches().size();
         }
         return new CompiledScriptFile(runtime, loadedScripts, watcherCount);
+    }
+
+    private HostAccess createRestrictedHostAccess() {
+        List<Class<?>> types = new ArrayList<>(List.of(ScriptBootstrap.class, ScriptInvocationContext.class,
+                ScriptLeaderboardEntry.class, ScriptMath.class, ScriptText.class, ScriptFormat.class, ScriptTime.class));
+        types.addAll(List.of(ScriptToolkit.class.getDeclaredClasses()));
+        return JsSandbox.expose(method -> method.getDeclaringClass() != ScriptInvocationContext.class
+                        || (!method.getName().equals("player") && !method.getName().equals("offlinePlayer")
+                        && !method.getName().equals("causingPlayer")),
+                types.toArray(Class<?>[]::new));
     }
 
     private eScoreScript parseDefinition(Path file, ScriptRuntime runtime, Value definition) {
@@ -1025,11 +1079,12 @@ public final class ScriptManager {
             if (leaderboardRequest != null) {
                 return Optional.of(resolveLeaderboardPlaceholder(script, leaderboardRequest, player, scope));
             }
-            if (player != null && script.cacheTtlMillis() > 0L) {
+            if (script.cacheTtlMillis() > 0L) {
                 return Optional.ofNullable(resolveCachedPlaceholder(script, player, scope));
             }
             return Optional.ofNullable(renderPlaceholder(script, player, scope));
         } catch (Exception exception) {
+            profiles.computeIfAbsent(script.id(), ignored -> new ScriptProfile()).errors().incrementAndGet();
             log.warn("Failed to resolve script placeholder " + script.id() + ": " + exception.getMessage());
             return Optional.empty();
         } finally {
@@ -1153,13 +1208,13 @@ public final class ScriptManager {
             return value == null;
         }
         if (policy.noDataWhenFunction() != null) {
-            Object decision = convertValue(policy.noDataWhenFunction().execute(value, context));
+            Object decision = executeFunction(context.script, policy.noDataWhenFunction(), value, context);
             if (decision instanceof Boolean bool) {
                 return bool;
             }
         }
         if (policy.hasDataFunction() != null) {
-            Object decision = convertValue(policy.hasDataFunction().execute(value, context));
+            Object decision = executeFunction(context.script, policy.hasDataFunction(), value, context);
             if (decision instanceof Boolean bool) {
                 return !bool;
             }
@@ -1204,13 +1259,15 @@ public final class ScriptManager {
     }
 
     private String resolveCachedPlaceholder(eScoreScript script, OfflinePlayer player, eScoreScope scope) {
-        PlaceholderCacheKey cacheKey = new PlaceholderCacheKey(player.getUniqueId(), script.id(), scope);
+        PlaceholderCacheKey cacheKey = new PlaceholderCacheKey(player == null ? null : player.getUniqueId(), script.id(), scope);
         CacheEntry cached = placeholderCache.get(cacheKey);
         long now = System.currentTimeMillis();
         if (cached != null && cached.expiresAt() >= now) {
+            profiles.computeIfAbsent(script.id(), ignored -> new ScriptProfile()).cacheHits().incrementAndGet();
             return cached.value() == null ? "" : String.valueOf(cached.value());
         }
 
+        profiles.computeIfAbsent(script.id(), ignored -> new ScriptProfile()).cacheMisses().incrementAndGet();
         String rendered = renderPlaceholder(script, player, scope);
         placeholderCache.put(cacheKey, new CacheEntry(rendered, now + script.cacheTtlMillis()));
         return rendered;
@@ -1222,17 +1279,15 @@ public final class ScriptManager {
             Object value = resolveBaseValue(script, player, scope);
             ScriptInvocationContext context = new ScriptInvocationContext(script, player, value);
 
-            synchronized (script.runtime()) {
-                if (script.transformFunction() != null) {
-                    value = convertValue(script.transformFunction().execute(value, context));
-                }
-                if (isNoData(script.noDataPolicy(), value, context)) {
-                    return zeroDataPlaceholder(script.noDataPolicy());
-                }
-                if (script.renderFunction() != null) {
-                    Object rendered = convertValue(script.renderFunction().execute(value, context));
-                    return rendered == null ? zeroDataPlaceholder(script.noDataPolicy()) : String.valueOf(rendered);
-                }
+            if (script.transformFunction() != null) {
+                value = executeFunction(script, script.transformFunction(), value, context);
+            }
+            if (isNoData(script.noDataPolicy(), value, context)) {
+                return zeroDataPlaceholder(script.noDataPolicy());
+            }
+            if (script.renderFunction() != null) {
+                Object rendered = executeFunction(script, script.renderFunction(), value, context);
+                return rendered == null ? zeroDataPlaceholder(script.noDataPolicy()) : String.valueOf(rendered);
             }
             return value == null ? zeroDataPlaceholder(script.noDataPolicy()) : String.valueOf(value);
         } finally {
@@ -1426,17 +1481,15 @@ public final class ScriptManager {
         ScriptInvocationContext context = new ScriptInvocationContext(binding.script(), player, current);
         long startedAt = System.nanoTime();
         try {
-            synchronized (binding.script().runtime()) {
-                if (binding.watch().filterFunction() != null) {
-                    Object accepted = convertValue(binding.watch().filterFunction().execute(event, current, context));
-                    if (!(accepted instanceof Boolean bool) || !bool) {
-                        return;
-                    }
+            if (binding.watch().filterFunction() != null) {
+                Object accepted = executeFunction(binding.script(), binding.watch().filterFunction(), safeEvent(event), current, context);
+                if (!(accepted instanceof Boolean bool) || !bool) {
+                    return;
                 }
-
-                Object updated = convertValue(binding.watch().updateFunction().execute(event, current, context));
-                dataStore.setValue(player.getUniqueId(), runtimeStorageKey, updated);
             }
+
+            Object updated = executeFunction(binding.script(), binding.watch().updateFunction(), safeEvent(event), current, context);
+            dataStore.setValue(player.getUniqueId(), runtimeStorageKey, updated);
         } finally {
             recordProfile(binding.script().id(), System.nanoTime() - startedAt);
         }
@@ -1444,12 +1497,10 @@ public final class ScriptManager {
 
     private UUID extractPlayerId(WatcherBinding binding, Object event) {
         if (binding.watch().playerFunction() != null) {
-            synchronized (binding.script().runtime()) {
-                Object result = convertValue(binding.watch().playerFunction().execute(event, new ScriptInvocationContext(binding.script(), null, null)));
-                UUID playerId = asPlayerId(result);
-                if (playerId != null) {
-                    return playerId;
-                }
+            Object result = executeFunction(binding.script(), binding.watch().playerFunction(), safeEvent(event), new ScriptInvocationContext(binding.script(), null, null));
+            UUID playerId = asPlayerId(result);
+            if (playerId != null) {
+                return playerId;
             }
         }
 
@@ -1673,6 +1724,71 @@ public final class ScriptManager {
         }
     }
 
+    private Object executeFunction(eScoreScript script, Value function, Object... arguments) {
+        try {
+            return convertValue(script.runtime().call(() -> function.execute(arguments)));
+        } catch (Exception exception) {
+            String detail = exception.getMessage();
+            if (detail == null || detail.isBlank()) {
+                detail = exception.getClass().getSimpleName();
+            }
+            throw new ScriptExecutionException(script.id() + ": " + detail, exception);
+        }
+    }
+
+    private Map<String, Object> safeEvent(Object event) {
+        Map<String, Object> view = new LinkedHashMap<>();
+        if (event == null) {
+            return view;
+        }
+        if (event instanceof Map<?, ?> map) {
+            map.forEach((key, value) -> view.put(String.valueOf(key), safeEventValue(value)));
+            return view;
+        }
+        view.put("type", event.getClass().getSimpleName());
+        UUID playerId = tryDamageSourcePlayerId(event);
+        if (playerId == null) {
+            playerId = tryCommonPlayerMethods(event);
+        }
+        if (playerId != null) {
+            view.put("playerId", playerId.toString());
+            OfflinePlayer player = Bukkit.getOfflinePlayer(playerId);
+            view.put("playerName", player.getName() == null ? playerId.toString() : player.getName());
+        }
+        copySafeEventProperty(view, event, "getMessage", "message");
+        copySafeEventProperty(view, event, "getAction", "action");
+        copySafeEventProperty(view, event, "getCause", "cause");
+        copySafeEventProperty(view, event, "getEntityType", "entityType");
+        copySafeEventProperty(view, event, "getDeathMessage", "deathMessage");
+        copySafeEventProperty(view, event, "getDroppedExp", "droppedExp");
+        copySafeEventProperty(view, event, "getExpToDrop", "expToDrop");
+        copySafeEventProperty(view, event, "getSlot", "slot");
+        return view;
+    }
+
+    private void copySafeEventProperty(Map<String, Object> target, Object event, String methodName, String key) {
+        try {
+            Object value = event.getClass().getMethod(methodName).invoke(event);
+            if (value != null) {
+                target.put(key, safeEventValue(value));
+            }
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+        }
+    }
+
+    private Object safeEventValue(Object value) {
+        if (value == null || value instanceof String || value instanceof Number || value instanceof Boolean) {
+            return value;
+        }
+        if (value instanceof Enum<?> enumValue) {
+            return enumValue.name();
+        }
+        if (value instanceof UUID uuid) {
+            return uuid.toString();
+        }
+        return String.valueOf(value);
+    }
+
     public final class ScriptInvocationContext {
         private final eScoreScript script;
         private final OfflinePlayer player;
@@ -1839,6 +1955,10 @@ public final class ScriptManager {
         }
 
         public String causingPlayerId(Object event) {
+            if (event instanceof Map<?, ?> map) {
+                Object value = map.get("playerId");
+                return value == null ? null : String.valueOf(value);
+            }
             UUID playerId = tryDamageSourcePlayerId(event);
             return playerId == null ? null : playerId.toString();
         }
@@ -1989,10 +2109,19 @@ public final class ScriptManager {
     public static final class ScriptRuntime implements AutoCloseable {
         private final Path file;
         private final Context context;
+        private final ScheduledExecutorService watchdog;
+        private final Object executionLock;
+        private final long executionLimitMillis;
+        private final AtomicBoolean healthy = new AtomicBoolean(true);
+        private final AtomicLong timeoutCount = new AtomicLong();
+        private final ThreadLocal<Integer> callDepth = ThreadLocal.withInitial(() -> 0);
 
-        public ScriptRuntime(Path file, Context context) {
+        public ScriptRuntime(Path file, Context context, ScheduledExecutorService watchdog, Object executionLock, long executionLimitMillis) {
             this.file = file;
             this.context = context;
+            this.watchdog = watchdog;
+            this.executionLock = executionLock;
+            this.executionLimitMillis = executionLimitMillis;
         }
 
         public Path file() {
@@ -2003,8 +2132,49 @@ public final class ScriptManager {
             return context;
         }
 
+        public boolean healthy() {
+            return healthy.get();
+        }
+
+        public long timeoutCount() {
+            return timeoutCount.get();
+        }
+
+        public <T> T call(java.util.concurrent.Callable<T> action) throws Exception {
+            return call(executionLimitMillis, action);
+        }
+
+        public <T> T call(long limitMillis, java.util.concurrent.Callable<T> action) throws Exception {
+            synchronized (executionLock) {
+                if (!healthy.get()) {
+                    throw new IllegalStateException("JavaScript runtime is disabled after a previous timeout.");
+                }
+                if (callDepth.get() > 0) {
+                    return action.call();
+                }
+                AtomicBoolean completed = new AtomicBoolean(false);
+                ScheduledFuture<?> killer = watchdog.schedule(() -> {
+                    if (completed.compareAndSet(false, true)) {
+                        healthy.set(false);
+                        timeoutCount.incrementAndGet();
+                        context.close(true);
+                    }
+                }, Math.max(1L, limitMillis), TimeUnit.MILLISECONDS);
+                try {
+                    callDepth.set(1);
+                    return action.call();
+                } finally {
+                    callDepth.remove();
+                    if (completed.compareAndSet(false, true)) {
+                        killer.cancel(false);
+                    }
+                }
+            }
+        }
+
         @Override
         public void close() {
+            healthy.set(false);
             context.close(true);
         }
     }
@@ -2054,10 +2224,12 @@ public final class ScriptManager {
                     throw new IllegalArgumentException("Module path escapes scripts directory.");
                 }
                 String code = Files.readString(path);
-                Value factory = runtime.context().eval(Source.newBuilder("js", "(function(exports, wscore){\n" + code + "\n; return exports; })", path.getFileName().toString()).build());
-                Value exports = runtime.context().eval("js", "({})");
-                factory.execute(exports, runtime.context().eval("js", "wscore"));
-                return exports;
+                return runtime.call(() -> {
+                    Value factory = runtime.context().eval(Source.newBuilder("js", "(function(exports, wscore){\n" + code + "\n; return exports; })", path.getFileName().toString()).build());
+                    Value exports = runtime.context().eval("js", "({})");
+                    factory.execute(exports, runtime.context().eval("js", "wscore"));
+                    return exports;
+                });
             } catch (Exception exception) {
                 log.warn("Failed to load JS module '" + relativePath + "': " + exception.getMessage());
                 return runtime.context().eval("js", "({})");
@@ -2190,13 +2362,21 @@ public final class ScriptManager {
     private record ScopedPlaceholderRequest(String placeholderId, eScoreScope scope) {
     }
 
-    private record ScriptProfile(AtomicLong calls, AtomicLong totalNanos, AtomicLong maxNanos) {
+    private record ScriptProfile(AtomicLong calls, AtomicLong totalNanos, AtomicLong maxNanos,
+                                 AtomicLong cacheHits, AtomicLong cacheMisses, AtomicLong errors) {
         private ScriptProfile() {
-            this(new AtomicLong(), new AtomicLong(), new AtomicLong());
+            this(new AtomicLong(), new AtomicLong(), new AtomicLong(), new AtomicLong(), new AtomicLong(), new AtomicLong());
         }
     }
 
-    public record ScriptProfileSnapshot(String id, long calls, double totalMillis, double avgMillis, double maxMillis) {
+    public record ScriptProfileSnapshot(String id, long calls, double totalMillis, double avgMillis, double maxMillis,
+                                        long cacheHits, long cacheMisses, long errors) {
+    }
+
+    private static final class ScriptExecutionException extends RuntimeException {
+        private ScriptExecutionException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 
     public static final class ScriptMath {

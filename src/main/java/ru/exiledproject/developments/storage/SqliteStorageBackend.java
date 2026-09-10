@@ -23,8 +23,9 @@ public final class SqliteStorageBackend extends AbstractJdbcStorageBackend {
 
     @Override
     protected String upsertSql() {
-        return "INSERT INTO " + tableName() + " (player_uuid, data_key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
-                "ON CONFLICT(player_uuid, data_key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at";
+        return "INSERT INTO " + tableName() + " (player_uuid, data_key, value_json, updated_at, expires_at) VALUES (?, ?, ?, ?, ?) " +
+                "ON CONFLICT(player_uuid, data_key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at, expires_at = excluded.expires_at " +
+                "WHERE excluded.updated_at >= " + tableName() + ".updated_at";
     }
 
     @Override

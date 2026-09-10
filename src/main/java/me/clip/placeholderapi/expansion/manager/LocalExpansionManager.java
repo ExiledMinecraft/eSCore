@@ -275,19 +275,28 @@ public final class LocalExpansionManager implements Listener {
             LoadedExpansionSource source = new LoadedExpansionSource(jarFile, classLoader, new LinkedHashSet<>());
             for (Class<? extends PlaceholderExpansion> expansionClass : classes) {
                 long classStartedAt = System.nanoTime();
-                PlaceholderExpansion expansion = createExpansionInstance(expansionClass);
-                if (expansion == null) {
-                    warnSlowLoad("instantiate expansion class " + expansionClass.getName(), classStartedAt);
-                    continue;
+                PlaceholderExpansion expansion = null;
+                try {
+                    expansion = createExpansionInstance(expansionClass);
+                    if (expansion == null) {
+                        plugin.getLogger().warning("Expansion class " + expansionClass.getName() + " has no usable no-argument constructor.");
+                        continue;
+                    }
+                    expansion.setExpansionType(PlaceholderExpansion.Type.EXTERNAL);
+                    if (!register(expansion)) {
+                        plugin.getLogger().warning("Expansion class " + expansionClass.getName() + " refused registration.");
+                        continue;
+                    }
+                    loaded.add(expansion);
+                    source.identifiers().add(normalize(expansion.getIdentifier()));
+                    warnSlowLoad("load expansion " + expansion.getIdentifier() + " from " + jarFile.getFileName(), classStartedAt);
+                } catch (LinkageError | RuntimeException exception) {
+                    if (expansion != null && expansion.isRegistered()) {
+                        unregister(expansion);
+                    }
+                    plugin.getLogger().warning("Failed to load expansion class " + expansionClass.getName() + " from "
+                            + jarFile.getFileName() + ": " + errorMessage(exception));
                 }
-                expansion.setExpansionType(PlaceholderExpansion.Type.EXTERNAL);
-                if (!register(expansion)) {
-                    warnSlowLoad("register expansion " + expansionClass.getName(), classStartedAt);
-                    continue;
-                }
-                loaded.add(expansion);
-                source.identifiers().add(normalize(expansion.getIdentifier()));
-                warnSlowLoad("load expansion " + expansion.getIdentifier() + " from " + jarFile.getFileName(), classStartedAt);
             }
 
             if (source.identifiers().isEmpty()) {
@@ -301,7 +310,7 @@ public final class LocalExpansionManager implements Listener {
             warnSlowLoad("scan/load expansion jar " + jarFile.getFileName(), jarStartedAt);
             return loaded;
         } catch (LinkageError | Exception exception) {
-            plugin.getLogger().warning("Failed to load expansion jar " + jarFile.getFileName() + ": " + exception.getMessage());
+            plugin.getLogger().warning("Failed to load expansion jar " + jarFile.getFileName() + ": " + errorMessage(exception));
             if (classLoader != null) {
                 try {
                     classLoader.close();
@@ -487,6 +496,11 @@ public final class LocalExpansionManager implements Listener {
 
     private String normalize(String value) {
         return value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private String errorMessage(Throwable throwable) {
+        String message = throwable.getMessage();
+        return message == null || message.isBlank() ? throwable.getClass().getSimpleName() : message;
     }
 
     private record LoadedExpansionSource(Path file, URLClassLoader classLoader, Set<String> identifiers) {

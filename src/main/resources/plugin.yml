@@ -20,7 +20,7 @@ commands:
   escore:
     description: Main eSCore command.
     aliases: [es, esc, wscore, wsc]
-    usage: /<command> <reload|check|integrations>
+    usage: /<command> <reload|check|script|diagnose|storage|integrations>
   placeholderapi:
     description: PlaceholderAPI compatibility command.
     aliases: [papi]

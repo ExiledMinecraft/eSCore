@@ -170,6 +170,10 @@ public class eSCorePlugin extends JavaPlugin implements Listener {
         return storageManager;
     }
 
+    public RedisSyncManager getRedisSyncManager() {
+        return redisSyncManager;
+    }
+
     public String getServerId() {
         return serverId;
     }
@@ -248,6 +252,10 @@ public class eSCorePlugin extends JavaPlugin implements Listener {
     }
 
     private void onPlayerValueChange(PlayerValueChange change) {
+        if (!Bukkit.isPrimaryThread()) {
+            runSyncIfEnabled(() -> onPlayerValueChange(change));
+            return;
+        }
         scriptManager.invalidateStorageKey(change.playerId(), change.key());
         scriptManager.onPlayerValueChange(change);
         storageManager.onValueChange(change);

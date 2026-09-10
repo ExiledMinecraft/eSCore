@@ -1,6 +1,6 @@
 package me.clip.placeholderapi.replacer;
 
-import me.clip.placeholderapi.expansion.PlaceholderExpansion;
+import me.clip.placeholderapi.PlaceholderHook;
 import org.bukkit.OfflinePlayer;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -12,7 +12,7 @@ public interface Replacer {
     String apply(
             @NotNull String text,
             @Nullable OfflinePlayer player,
-            @NotNull Function<String, @Nullable PlaceholderExpansion> lookup
+            @NotNull Function<String, @Nullable PlaceholderHook> lookup
     );
 
     enum Closure {

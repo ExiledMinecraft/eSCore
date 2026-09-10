@@ -13,6 +13,7 @@ import ru.exiledproject.developments.script.ScriptLoadReport;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.nio.file.Path;
 
 public final class eScoreCommand implements CommandExecutor, TabCompleter {
     private final eSCorePlugin plugin;
@@ -42,6 +43,9 @@ public final class eScoreCommand implements CommandExecutor, TabCompleter {
                     handleCheck(sender, 5);
                 }
             }
+            case "script", "scripts" -> handleScripts(sender, args);
+            case "diagnose" -> handleDiagnose(sender);
+            case "storage" -> handleStorage(sender, args);
             case "integrations" -> handleIntegrations(sender, args);
             default -> sendHelp(sender);
         }
@@ -51,13 +55,25 @@ public final class eScoreCommand implements CommandExecutor, TabCompleter {
     @Override
     public @Nullable List<String> onTabComplete(@NotNull CommandSender sender, @NotNull Command command, @NotNull String alias, @NotNull String[] args) {
         if (args.length == 1) {
-            return filter(args[0], List.of("reload", "check", "integrations"));
+            return filter(args[0], List.of("reload", "check", "script", "diagnose", "storage", "integrations"));
         }
         if (args.length == 2 && "check".equalsIgnoreCase(args[0])) {
             return filter(args[1], List.of("profile"));
         }
         if (args.length == 2 && "integrations".equalsIgnoreCase(args[0])) {
             return filter(args[1], List.of("reload", "list", "check"));
+        }
+        if (args.length == 2 && ("script".equalsIgnoreCase(args[0]) || "scripts".equalsIgnoreCase(args[0]))) {
+            return filter(args[1], List.of("list", "validate", "reload", "profile"));
+        }
+        if (args.length == 2 && "storage".equalsIgnoreCase(args[0])) {
+            return filter(args[1], List.of("status", "flush", "export", "import"));
+        }
+        if (args.length == 3 && ("script".equalsIgnoreCase(args[0]) || "scripts".equalsIgnoreCase(args[0]))) {
+            if ("profile".equalsIgnoreCase(args[1])) {
+                return filter(args[2], List.of("5", "10", "20", "50"));
+            }
+            return filter(args[2], new ArrayList<>(plugin.getScriptManager().getPlaceholderIds()));
         }
         if (args.length == 3 && "check".equalsIgnoreCase(args[0]) && "profile".equalsIgnoreCase(args[1])) {
             return filter(args[2], List.of("5", "10", "20", "50"));
@@ -109,6 +125,117 @@ public final class eScoreCommand implements CommandExecutor, TabCompleter {
         lines.forEach(line -> plugin.log().send(sender, "&7Profile: &f" + line));
     }
 
+    private void handleScripts(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            plugin.log().send(sender, "&eUsage: /escore script <list|validate|reload> [id] | profile [limit]");
+            return;
+        }
+        String requestedId = args.length >= 3 ? args[2].toLowerCase(Locale.ROOT) : "";
+        switch (args[1].toLowerCase(Locale.ROOT)) {
+            case "list" -> {
+                List<String> ids = new ArrayList<>(plugin.getScriptManager().getPlaceholderIds());
+                ids.sort(String.CASE_INSENSITIVE_ORDER);
+                plugin.log().send(sender, "&aLoaded script placeholders: &f" + ids.size());
+                ids.forEach(id -> plugin.log().send(sender, "&7- &f" + id));
+            }
+            case "validate" -> {
+                ScriptLoadReport report = plugin.checkScripts();
+                plugin.log().send(sender, report.hasErrors() ? "&cValidation failed." : "&aValidation successful.");
+                if (!requestedId.isBlank()) {
+                    plugin.log().send(sender, "&7Requested id: &f" + requestedId + "&7 (the complete pack is checked to preserve dependency safety)");
+                }
+                sendReportIssues(sender, report);
+            }
+            case "reload" -> {
+                ScriptLoadReport report = plugin.getScriptManager().reload();
+                plugin.log().send(sender, report.hasErrors() ? "&cScript reload rejected; previous runtime remains active." : "&aScripts reloaded atomically.");
+                if (!requestedId.isBlank()) {
+                    plugin.log().send(sender, "&7Requested id: &f" + requestedId + "&7 (dependent scripts were reloaded with it)");
+                }
+                sendReportIssues(sender, report);
+            }
+            case "profile" -> handleProfile(sender, new String[]{"check", "profile", args.length >= 3 ? args[2] : "10"});
+            default -> plugin.log().send(sender, "&eUsage: /escore script <list|validate|reload> [id] | profile [limit]");
+        }
+    }
+
+    private void handleDiagnose(CommandSender sender) {
+        plugin.log().send(sender, "&a--- eSCore diagnostics ---");
+        plugin.getScriptManager().getRuntimeStatusLines().forEach(line -> plugin.log().send(sender, "&7" + line));
+        plugin.getStorageManager().getStatusLines().forEach(line -> plugin.log().send(sender, "&7" + line));
+        plugin.log().send(sender, "&7" + plugin.getRedisSyncManager().getStatusLine());
+        plugin.log().send(sender, "&7Extensions: &f" + plugin.getExtensionManager().getLoadedCount());
+        plugin.log().send(sender, "&7eCloud cached expansions: &f" + plugin.getPlaceholderCompatManager().getCloudExpansionManager().getCachedExpansionCount());
+        plugin.getPlaceholderCompatManager().getCloudExpansionManager().getSourceStatusMap()
+                .forEach((source, state) -> plugin.log().send(sender, "&7eCloud " + source + ": &f" + state));
+    }
+
+    private void handleStorage(CommandSender sender, String[] args) {
+        String action = args.length >= 2 ? args[1].toLowerCase(Locale.ROOT) : "status";
+        if ("status".equals(action)) {
+            plugin.getStorageManager().getStatusLines().forEach(line -> plugin.log().send(sender, "&7" + line));
+            return;
+        }
+        if ("flush".equals(action)) {
+            plugin.executeAsync(() -> {
+                plugin.getStorageManager().flushAll();
+                plugin.runSyncIfEnabled(() -> plugin.log().send(sender, "&aStorage flush completed."));
+            });
+            return;
+        }
+        if ("export".equals(action)) {
+            String name = args.length >= 3 ? args[2] : "storage-" + System.currentTimeMillis();
+            Path file = transferFile(name);
+            if (file == null) {
+                plugin.log().send(sender, "&cExport name may only contain letters, numbers, dot, dash and underscore.");
+                return;
+            }
+            plugin.executeAsync(() -> {
+                try {
+                    Path exported = plugin.getStorageManager().exportSnapshot(file);
+                    plugin.runSyncIfEnabled(() -> plugin.log().send(sender, "&aStorage exported to &f" + exported.getFileName()));
+                } catch (Exception exception) {
+                    plugin.runSyncIfEnabled(() -> plugin.log().send(sender, "&cStorage export failed: &7" + exception.getMessage()));
+                }
+            });
+            return;
+        }
+        if ("import".equals(action)) {
+            if (args.length < 4 || !"--confirm".equalsIgnoreCase(args[3])) {
+                plugin.log().send(sender, "&eUsage: /escore storage import <file> --confirm");
+                return;
+            }
+            Path file = transferFile(args[2]);
+            if (file == null || !java.nio.file.Files.isRegularFile(file)) {
+                plugin.log().send(sender, "&cImport file was not found in plugins/eSCore/exports.");
+                return;
+            }
+            plugin.executeAsync(() -> {
+                try {
+                    var document = plugin.getStorageManager().readImport(file);
+                    plugin.runSyncIfEnabled(() -> {
+                        int count = plugin.getStorageManager().applyImport(document);
+                        plugin.log().send(sender, "&aImported &f" + count + "&a storage values.");
+                    });
+                } catch (Exception exception) {
+                    plugin.runSyncIfEnabled(() -> plugin.log().send(sender, "&cStorage import failed: &7" + exception.getMessage()));
+                }
+            });
+            return;
+        }
+        plugin.log().send(sender, "&eUsage: /escore storage <status|flush|export|import>");
+    }
+
+    private Path transferFile(String requestedName) {
+        String name = requestedName.endsWith(".json") ? requestedName : requestedName + ".json";
+        if (!name.matches("[A-Za-z0-9._-]{1,100}\\.json")) {
+            return null;
+        }
+        Path directory = plugin.getDataFolder().toPath().resolve("exports").toAbsolutePath().normalize();
+        Path file = directory.resolve(name).normalize();
+        return file.getParent().equals(directory) ? file : null;
+    }
+
     private void handleIntegrations(CommandSender sender, String[] args) {
         if (args.length < 2) {
             plugin.log().send(sender, "&eUsage: /escore integrations <reload|list|check>");
@@ -144,6 +271,9 @@ public final class eScoreCommand implements CommandExecutor, TabCompleter {
         plugin.log().send(sender, "&e/escore reload &7- reload runtime, scripts, storage and integrations");
         plugin.log().send(sender, "&e/escore check &7- validate scripts and report issues");
         plugin.log().send(sender, "&e/escore check profile [limit] &7- show the busiest scripts");
+        plugin.log().send(sender, "&e/escore script <list|validate|reload|profile> [id] &7- manage JavaScript placeholders");
+        plugin.log().send(sender, "&e/escore diagnose &7- inspect scripts, cache, storage and eCloud");
+        plugin.log().send(sender, "&e/escore storage <status|flush|export|import> &7- manage persistence");
         plugin.log().send(sender, "&e/escore integrations <reload|list|check> &7- inspect integration state");
     }
 

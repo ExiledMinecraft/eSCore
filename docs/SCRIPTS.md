@@ -610,7 +610,7 @@ watch: [
 
 ```js
 filter(event, current, ctx) {
-  return event.getPlayer().hasPermission("escore.track");
+  return event.playerName !== "Bot";
 }
 ```
 
@@ -927,3 +927,31 @@ escore.time.hours(2)
 - backend persistence включайте только там, где данные реально должны переживать рестарт;
 - в multi-server setup используйте `sync.mode: "auto"` или `redis`;
 - оставляйте legacy `wscore` только для миграции старых script-pack'ов.
+
+## Безопасность GraalJS
+
+Один Graal engine переиспользуется всеми скриптами, а для каждого файла создаётся долгоживущий context. Context не создаётся при каждом вызове placeholder.
+
+По умолчанию скриптам запрещены:
+
+- `Java.type(...)` и загрузка Java-классов;
+- файловая система и сеть;
+- создание процессов и потоков;
+- native access;
+- прямое получение Bukkit `Player`, `OfflinePlayer` и произвольного объекта события.
+
+Событие передаётся скрипту как безопасная map с простыми полями (`type`, `playerId`, `playerName`, `message`, `action` и доступные числовые поля). Старый Nashorn compatibility можно временно включить через `scripts.runtime.nashorn-compat`, но для новых установок он должен оставаться выключенным.
+
+`scripts.runtime.max-execution-millis` ограничивает один JS-вызов. После превышения лимита context принудительно закрывается и остаётся отключённым до успешного reload. Загрузка файла отдельно ограничена `max-load-millis`.
+
+Управление:
+
+```text
+/escore script list
+/escore script validate [id]
+/escore script reload [id]
+/escore script profile [limit]
+/escore diagnose
+```
+
+Validate и reload проверяют весь script-pack: это необходимо, чтобы не активировать скрипт с поломанной зависимостью. При ошибке новый набор отклоняется, а предыдущий runtime продолжает работать.

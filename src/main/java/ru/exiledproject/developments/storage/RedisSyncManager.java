@@ -8,6 +8,7 @@ import ru.exiledproject.developments.core.eScoreLogger;
 import ru.exiledproject.developments.data.ChangeOrigin;
 import ru.exiledproject.developments.data.PlayerDataStore;
 import ru.exiledproject.developments.data.PlayerValueChange;
+import ru.exiledproject.developments.data.PersistedValue;
 import ru.exiledproject.developments.eSCorePlugin;
 import ru.exiledproject.developments.script.ScriptManager;
 import ru.exiledproject.developments.script.SyncMode;
@@ -25,8 +26,10 @@ public final class RedisSyncManager {
     private final eScoreLogger log;
     private final Gson gson = new GsonBuilder().create();
 
-    private Thread subscriberThread;
-    private JedisPubSub pubSub;
+    private volatile Thread subscriberThread;
+    private volatile JedisPubSub pubSub;
+    private volatile String connectionState = "disabled";
+    private volatile long reconnectAttempts;
 
     public RedisSyncManager(eSCorePlugin plugin, PlayerDataStore dataStore, ScriptManager scriptManager, StorageManager storageManager, eScoreLogger log) {
         this.plugin = plugin;
@@ -39,6 +42,7 @@ public final class RedisSyncManager {
     public void reload() {
         shutdown();
         if (!isEnabled()) {
+            connectionState = "disabled";
             return;
         }
         pubSub = new JedisPubSub() {
@@ -50,10 +54,12 @@ public final class RedisSyncManager {
         subscriberThread = new Thread(this::runSubscriber, "eSCore-RedisSync");
         subscriberThread.setDaemon(true);
         subscriberThread.start();
+        connectionState = "connecting";
         log.success("Redis sync enabled.");
     }
 
     public void shutdown() {
+        connectionState = "disabled";
         if (pubSub != null) {
             try {
                 pubSub.unsubscribe();
@@ -61,9 +67,15 @@ public final class RedisSyncManager {
             }
             pubSub = null;
         }
-        if (subscriberThread != null) {
-            subscriberThread.interrupt();
-            subscriberThread = null;
+        Thread thread = subscriberThread;
+        subscriberThread = null;
+        if (thread != null) {
+            thread.interrupt();
+            try {
+                thread.join(Math.max(250L, timeoutMillis()));
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -76,28 +88,33 @@ public final class RedisSyncManager {
             return;
         }
 
+        PersistedValue persisted = dataStore.getPersistedValue(change.playerId(), change.key());
+        long expiresAt = persisted == null ? 0L : persisted.expiresAt();
         RedisMessage message = new RedisMessage(
                 plugin.getServerId(),
                 change.playerId(),
                 change.key(),
                 change.newValue(),
                 change.updatedAt(),
-                script.remoteTtlMillis()
+                script.remoteTtlMillis(),
+                expiresAt
         );
 
-        withJedis(jedis -> {
+        plugin.executeAsync(() -> withJedis(jedis -> {
             jedis.publish(channel(), gson.toJson(message));
             String runtimeKey = runtimeKey(change.key(), change.playerId());
             if (change.newValue() == null) {
                 jedis.del(runtimeKey);
             } else {
-                if (script.remoteTtlMillis() > 0L) {
-                    jedis.psetex(runtimeKey, script.remoteTtlMillis(), gson.toJson(message));
+                long remainingValueTtl = expiresAt <= 0L ? Long.MAX_VALUE : Math.max(1L, expiresAt - System.currentTimeMillis());
+                long redisTtl = script.remoteTtlMillis() <= 0L ? remainingValueTtl : Math.min(script.remoteTtlMillis(), remainingValueTtl);
+                if (redisTtl != Long.MAX_VALUE) {
+                    jedis.psetex(runtimeKey, redisTtl, gson.toJson(message));
                 } else {
                     jedis.set(runtimeKey, gson.toJson(message));
                 }
             }
-        });
+        }));
     }
 
     public void prefetchPlayer(UUID playerId) {
@@ -120,33 +137,59 @@ public final class RedisSyncManager {
                         continue;
                     }
                     RedisMessage message = gson.fromJson(raw, RedisMessage.class);
-                    dataStore.setValue(playerId, message.key(), message.value(), ChangeOrigin.REMOTE_REDIS, message.updatedAt());
+                    if (isValid(message)) {
+                        plugin.runSyncIfEnabled(() -> dataStore.setValue(playerId, message.key(), message.value(), ChangeOrigin.REMOTE_REDIS, message.updatedAt(), message.expiresAt()));
+                    }
                 }
             });
         });
     }
 
     private void runSubscriber() {
-        try (Jedis jedis = new Jedis(host(), port(), timeoutMillis())) {
-            if (!password().isBlank()) {
-                jedis.auth(password());
+        long backoffMillis = 1000L;
+        while (!Thread.currentThread().isInterrupted() && isEnabled()) {
+            JedisPubSub subscriber = pubSub;
+            if (subscriber == null) {
+                return;
             }
-            jedis.select(database());
-            jedis.subscribe(pubSub, channel());
-        } catch (Exception exception) {
-            if (!Thread.currentThread().isInterrupted()) {
-                log.warn("Redis subscriber stopped: " + exception.getMessage());
+            try (Jedis jedis = new Jedis(host(), port(), timeoutMillis())) {
+                connectionState = "connecting";
+                if (!password().isBlank()) {
+                    jedis.auth(password());
+                }
+                jedis.select(database());
+                connectionState = "connected";
+                backoffMillis = 1000L;
+                jedis.subscribe(subscriber, channel());
+            } catch (Exception exception) {
+                if (Thread.currentThread().isInterrupted() || !isEnabled()) {
+                    return;
+                }
+                reconnectAttempts++;
+                connectionState = "reconnecting in " + backoffMillis + "ms";
+                log.warn("Redis subscriber disconnected: " + exception.getMessage());
+                try {
+                    Thread.sleep(backoffMillis);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                backoffMillis = Math.min(30_000L, backoffMillis * 2L);
             }
         }
+    }
+
+    public String getStatusLine() {
+        return "Redis: " + connectionState + ", reconnects=" + reconnectAttempts;
     }
 
     private void handleIncoming(String rawMessage) {
         try {
             RedisMessage message = gson.fromJson(rawMessage, RedisMessage.class);
-            if (message == null || plugin.getServerId().equals(message.serverId())) {
+            if (!isValid(message) || plugin.getServerId().equals(message.serverId())) {
                 return;
             }
-            dataStore.setValue(message.playerId(), message.key(), message.value(), ChangeOrigin.REMOTE_REDIS, message.updatedAt());
+            plugin.runSyncIfEnabled(() -> dataStore.setValue(message.playerId(), message.key(), message.value(), ChangeOrigin.REMOTE_REDIS, message.updatedAt(), message.expiresAt()));
         } catch (Exception exception) {
             log.debug("Ignored invalid Redis payload: " + exception.getMessage());
         }
@@ -166,6 +209,14 @@ public final class RedisSyncManager {
 
     private boolean isEnabled() {
         return plugin.getConfig().getBoolean("sync.redis.enabled", false);
+    }
+
+    private boolean isValid(RedisMessage message) {
+        return message != null
+                && message.serverId() != null
+                && message.playerId() != null
+                && message.key() != null
+                && !message.key().isBlank();
     }
 
     private String host() {
@@ -200,7 +251,7 @@ public final class RedisSyncManager {
         return prefix() + ":runtime:" + key + ":" + playerId;
     }
 
-    private record RedisMessage(String serverId, UUID playerId, String key, Object value, long updatedAt, long ttlMillis) {
+    private record RedisMessage(String serverId, UUID playerId, String key, Object value, long updatedAt, long ttlMillis, long expiresAt) {
     }
 
     @FunctionalInterface

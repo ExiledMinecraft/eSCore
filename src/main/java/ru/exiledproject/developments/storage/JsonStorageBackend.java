@@ -10,6 +10,8 @@ import java.io.Writer;
 import java.lang.reflect.Type;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.StandardCopyOption;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -49,7 +51,7 @@ public final class JsonStorageBackend implements StorageBackend {
                 try {
                     UUID uuid = UUID.fromString(playerId);
                     Map<String, PersistedValue> playerValues = new ConcurrentHashMap<>();
-                    values.forEach((key, value) -> playerValues.put(key, new PersistedValue(value.value(), value.updatedAt())));
+                    values.forEach((key, value) -> playerValues.put(key, new PersistedValue(value.value(), value.updatedAt(), value.expiresAt())));
                     snapshot.put(uuid, playerValues);
                 } catch (IllegalArgumentException ignored) {
                 }
@@ -99,18 +101,32 @@ public final class JsonStorageBackend implements StorageBackend {
                     snapshot.remove(write.playerId());
                 }
             } else {
-                playerValues.put(write.key(), new PersistedValue(write.value(), write.updatedAt()));
+                playerValues.put(write.key(), new PersistedValue(write.value(), write.updatedAt(), write.expiresAt()));
             }
         }
-        Files.createDirectories(file.getParent());
+        Path absoluteFile = file.toAbsolutePath().normalize();
+        Path parent = absoluteFile.getParent();
+        if (parent == null) {
+            throw new IllegalStateException("JSON storage file has no parent directory: " + file);
+        }
+        Files.createDirectories(parent);
         Map<String, Map<String, JsonValue>> raw = new LinkedHashMap<>();
         snapshot.forEach((playerId, values) -> {
             Map<String, JsonValue> playerValues = new LinkedHashMap<>();
-            values.forEach((key, value) -> playerValues.put(key, new JsonValue(value.value(), value.updatedAt())));
+            values.forEach((key, value) -> playerValues.put(key, new JsonValue(value.value(), value.updatedAt(), value.expiresAt())));
             raw.put(playerId.toString(), playerValues);
         });
-        try (Writer writer = Files.newBufferedWriter(file)) {
+        Path temporary = Files.createTempFile(parent, ".escore-storage-", ".tmp");
+        try (Writer writer = Files.newBufferedWriter(temporary)) {
             gson.toJson(raw, FILE_TYPE, writer);
+        } catch (Exception exception) {
+            Files.deleteIfExists(temporary);
+            throw exception;
+        }
+        try {
+            Files.move(temporary, absoluteFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException ignored) {
+            Files.move(temporary, absoluteFile, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
@@ -123,6 +139,6 @@ public final class JsonStorageBackend implements StorageBackend {
     public void close() {
     }
 
-    private record JsonValue(Object value, long updatedAt) {
+    private record JsonValue(Object value, long updatedAt, long expiresAt) {
     }
 }

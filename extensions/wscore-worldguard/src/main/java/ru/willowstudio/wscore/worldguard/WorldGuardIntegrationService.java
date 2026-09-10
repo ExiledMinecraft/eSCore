@@ -20,9 +20,9 @@ import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
-import ru.willowstudio.wscore.api.WScoreApi;
-import ru.willowstudio.wscore.api.WScorePlaceholderHook;
-import ru.willowstudio.wscore.api.WScoreRegistration;
+import ru.exiledproject.developments.api.eScoreApi;
+import ru.exiledproject.developments.api.eScorePlaceholderHook;
+import ru.exiledproject.developments.api.eScoreRegistration;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -41,12 +41,12 @@ final class WorldGuardIntegrationService implements Listener {
     private static final long SNAPSHOT_TTL_MILLIS = 1000L;
 
     private final WScoreWorldGuardPlugin plugin;
-    private final WScoreApi api;
+    private final eScoreApi api;
     private final StateFlag trackFlag;
     private final Map<UUID, WorldGuardSnapshot> snapshots = new ConcurrentHashMap<>();
-    private final List<WScoreRegistration> registrations = new ArrayList<>();
+    private final List<eScoreRegistration> registrations = new ArrayList<>();
 
-    WorldGuardIntegrationService(WScoreWorldGuardPlugin plugin, WScoreApi api, StateFlag trackFlag) {
+    WorldGuardIntegrationService(WScoreWorldGuardPlugin plugin, eScoreApi api, StateFlag trackFlag) {
         this.plugin = plugin;
         this.api = api;
         this.trackFlag = trackFlag;
@@ -62,7 +62,7 @@ final class WorldGuardIntegrationService implements Listener {
 
     void disable() {
         HandlerList.unregisterAll(this);
-        for (WScoreRegistration registration : registrations) {
+        for (eScoreRegistration registration : registrations) {
             registration.unregister();
         }
         registrations.clear();
@@ -164,7 +164,7 @@ final class WorldGuardIntegrationService implements Listener {
         ));
         registrations.add(registerHook(
                 "worldguard_track_allowed",
-                "Whether WScore tracking is allowed in the player's current WorldGuard regions.",
+                "Whether eSCore tracking is allowed in the player's current WorldGuard regions.",
                 false,
                 player -> {
                     Player online = player.getPlayer();
@@ -182,8 +182,8 @@ final class WorldGuardIntegrationService implements Listener {
         ));
     }
 
-    private WScoreRegistration registerHook(String id, String description, boolean numeric, Function<OfflinePlayer, String> resolver) {
-        return api.registerPlaceholderHook(new WScorePlaceholderHook() {
+    private eScoreRegistration registerHook(String id, String description, boolean numeric, Function<OfflinePlayer, String> resolver) {
+        return api.registerPlaceholderHook(new eScorePlaceholderHook() {
             @Override
             public String getId() {
                 return id;
@@ -200,7 +200,7 @@ final class WorldGuardIntegrationService implements Listener {
             }
 
             @Override
-            public String resolve(OfflinePlayer player, WScoreApi api) {
+            public String resolve(OfflinePlayer player, eScoreApi api) {
                 return resolver.apply(player);
             }
         });
@@ -321,4 +321,3 @@ final class WorldGuardIntegrationService implements Listener {
         }
     }
 }
-

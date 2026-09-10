@@ -14,4 +14,9 @@ public interface eScorePlaceholderHook {
     }
 
     String resolve(OfflinePlayer player, eScoreApi api);
+
+    default eScorePlaceholderResult resolveResult(OfflinePlayer player, eScoreApi api) {
+        String value = resolve(player, api);
+        return value == null ? eScorePlaceholderResult.missing() : eScorePlaceholderResult.text(value);
+    }
 }

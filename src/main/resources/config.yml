@@ -5,6 +5,12 @@ storage:
   backend: sqlite
   flush-check-interval-ticks: 100
   database-poll-interval-ticks: 40
+  schema-version: 1
+  limits:
+    max-batch-size: 1000
+    max-key-length: 128
+    max-value-bytes: 65536
+    max-keys-per-player: 2048
 
   json:
     file: player-data.json
@@ -24,6 +30,7 @@ storage:
 
 sync:
   database-fallback: true
+  database-poll-overlap-millis: 5000
   runtime-prefetch-on-join: true
 
   redis:
@@ -40,6 +47,11 @@ sync:
 scripts:
   directory: scripts
   stop-on-first-error: false
+  runtime:
+    # Java/IO/network/process/thread access is denied. Enable only for old trusted packs.
+    nashorn-compat: false
+    max-load-millis: 1000
+    max-execution-millis: 25
   cache:
     default-placeholder-ttl-millis: 250
     default-source-refresh-ttl-millis: 250
@@ -54,6 +66,7 @@ placeholderapi:
   parser:
     keep-unresolved-placeholders: true
     max-passes: 2
+    max-recursion-depth: 16
 
   expansions:
     class-scan-timeout-millis: 5000
@@ -67,10 +80,11 @@ placeholderapi:
     command-timeout-millis: 15000
     connect-timeout-millis: 5000
     read-timeout-millis: 15000
+    max-download-bytes: 52428800
+    backups-to-keep: 3
     user-agent: eSCore/1.0
     mirrors:
-      - https://api.extendedclip.com/expansions/all/
-      - https://ecloud.placeholderapi.com/expansions/all/
+      - https://api.extendedclip.com/api/v3/?platform=bukkit
 
 luckperms:
   # Legacy single-rule format. Kept for backward compatibility.

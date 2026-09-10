@@ -6,8 +6,8 @@ import com.sk89q.worldguard.protection.flags.StateFlag;
 import com.sk89q.worldguard.protection.flags.registry.FlagRegistry;
 import com.sk89q.worldguard.protection.flags.registry.FlagConflictException;
 import org.bukkit.plugin.java.JavaPlugin;
-import ru.willowstudio.wscore.api.WScoreApi;
-import ru.willowstudio.wscore.api.WScoreProvider;
+import ru.exiledproject.developments.api.eScoreApi;
+import ru.exiledproject.developments.api.eScoreProvider;
 
 public final class WScoreWorldGuardPlugin extends JavaPlugin {
     public static final String TRACK_FLAG_NAME = "wscore-track";
@@ -28,7 +28,7 @@ public final class WScoreWorldGuardPlugin extends JavaPlugin {
             return;
         }
 
-        WScoreApi api = resolveApi();
+        eScoreApi api = resolveApi();
         integrationService = new WorldGuardIntegrationService(this, api, trackFlag);
         integrationService.enable();
         getLogger().info("WorldGuard integration ready. Flag: " + TRACK_FLAG_NAME + ", placeholders: 5, channels: 6");
@@ -66,15 +66,14 @@ public final class WScoreWorldGuardPlugin extends JavaPlugin {
         }
     }
 
-    private WScoreApi resolveApi() {
-        if (WScoreProvider.isAvailable()) {
-            return WScoreProvider.get();
+    private eScoreApi resolveApi() {
+        if (eScoreProvider.isAvailable()) {
+            return eScoreProvider.get();
         }
-        WScoreApi api = getServer().getServicesManager().load(WScoreApi.class);
+        eScoreApi api = getServer().getServicesManager().load(eScoreApi.class);
         if (api != null) {
             return api;
         }
-        throw new IllegalStateException("WScore API is not available.");
+        throw new IllegalStateException("eSCore API is not available.");
     }
 }
-
